@@ -18,6 +18,26 @@ const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12,
 
 const index = await api("/api/index");
 const arch = index.arch;
+$("#inf-hi").value = arch.n_layers - 1;
+$("#model-current").textContent = `${index.model} · ${arch.n_layers} layers · ${arch.inter} neurons per layer`;
+$("#model-mode").textContent = index.bundled ? "Lyra's cached Qwen exhibit. No live weights are loaded." : "Live checkpoint: loads on request. Neuron positions belong to this checkpoint only.";
+$("#model-choice").value = index.model;
+const quoteShell = s => "'" + s.replaceAll("'", "'\"'\"'") + "'";
+function modelCommand() { $("#model-command").textContent = "synapse stop\nsynapse start --model " + quoteShell($("#model-choice").value); }
+modelCommand();
+$("#model-choice").oninput = modelCommand;
+$("#model-copy").onclick = async () => { await navigator.clipboard.writeText($("#model-command").textContent); $("#model-copy").textContent = "Copied"; };
+$("#model-open").onclick = async () => {
+  $("#model-dialog").showModal();
+  const r = await api("/api/agent/overview");
+  $("#model-capabilities").textContent = JSON.stringify({status:r.status, runtime:r.runtime, calibration:r.calibration}, null, 2);
+};
+$("#model-load").disabled = index.cache_only;
+$("#model-load").onclick = async () => {
+  $("#model-load").disabled = true; $("#model-load").textContent = "Loading…";
+  try { const r = await api("/api/model/load", {}); $("#model-capabilities").textContent = JSON.stringify(r.runtime, null, 2); $("#model-load").textContent = "Model ready"; }
+  catch(e) { $("#model-capabilities").textContent = e.message; $("#model-load").textContent = "Retry loading"; $("#model-load").disabled = false; }
+};
 const tip = $("#tip");
 
 // ---------- map ----------
@@ -33,7 +53,7 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
     if (p.type === "block") {
       if (hoverKey) { hoverKey = null; map.setHoverConnections(null); }
       const full = p.full;
-      return showTip(x, y, `L${p.layer}`, full ? `full attention · ${arch.attn_heads} q / ${arch.kv_heads} kv heads` : `linear attention · ${arch.linear_k_heads} k / ${arch.linear_v_heads} v heads`);
+      return showTip(x, y, `L${p.layer}`, full ? `${arch.layer_types[p.layer].replaceAll("_", " ")} · ${arch.attn_heads} q / ${arch.kv_heads} kv heads` : `linear attention · ${arch.linear_k_heads} k / ${arch.linear_v_heads} v heads`);
     }
     const u = state.unitMap[p.layer]?.get(p.n), key = `${p.layer}/${p.n}`;
     const head = `L${p.layer} N${p.n}${u ? `  mass ${u.z.toFixed(1)}` : ""}`;
@@ -85,8 +105,8 @@ async function setLayout(kind) {
     const r = await api(`/api/layout?kind=${kind}`);
     if (wantLayout !== kind) return;
     if (!r.available) { document.querySelectorAll("#layout-mode button").forEach(b => b.classList.toggle("on", b.dataset.k === "index")); map.setLayout(null); return; }
-    const bin = atob(r.cell), a = new Int16Array(bin.length / 2);
-    for (let i = 0; i < a.length; i++) a[i] = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
+    const bin = atob(r.cell), a = new Int32Array(bin.length / 4);
+    for (let i = 0; i < a.length; i++) a[i] = bin.charCodeAt(4 * i) | (bin.charCodeAt(4 * i + 1) << 8) | (bin.charCodeAt(4 * i + 2) << 16) | (bin.charCodeAt(4 * i + 3) << 24);
     layouts[kind] = a;
   }
   map.setLayout(layouts[kind]);
@@ -108,7 +128,7 @@ async function refreshWeb() {
   const r = await fetch(`/api/web?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}`);
   if (!r.ok || webKey !== key) return;
   $("#web-z").title = `web: the open neuron's top links each way (later hops follow ${k}) · ${r.headers.get("X-Web-Total")} links`;
-  map.setWeb(new Int16Array(await r.arrayBuffer()));
+  map.setWeb(new Int32Array(await r.arrayBuffer()));
   const sum = await api(`/api/web/summary?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}&top=24`);
   if (webKey !== key) return;
   state.webSum = { ...sum, layer: f.layer, n: f.n, links: r.headers.get("X-Web-Total") };
@@ -250,7 +270,7 @@ async function showTokenPaths(pos) {
   const r = await fetch(`/api/infer/paths?pos=${pos}&min=${$("#inf-min").value || 1}`);
   if (!r.ok || (tokHover ?? state.inf.pos) !== pos) return;
   webKey = `tok/${pos}`;
-  map.setWeb(new Int16Array(await r.arrayBuffer()));
+  map.setWeb(new Int32Array(await r.arrayBuffer()));
 }
 function previewToken(pos) {
   const keep = state.inf.pos;
@@ -423,7 +443,7 @@ function syncEdge() {
   const on = focusEl.classList.contains("on"), col = focusEl.classList.contains("collapsed"), f = state.focus;
   const t = $("#focus-tab");
   t.classList.toggle("on", !on || col);
-  t.textContent = on && col && f ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : "‹ claude";
+  t.textContent = on && col && f ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : "‹ agent";
 }
 $("#list-hide").onclick = () => setListHidden(true);
 $("#list-tab").onclick = () => setListHidden(false);
@@ -741,7 +761,7 @@ const agent = { chat: null, ctl: null };
 const agentEl = $("#tab-claude");
 function mdInline(t) {
   return esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
-    .replace(/\bL(\d{1,2})[ \/]N(\d{1,4})\b/g, (m, l, n) => `<a class="nref" data-l="${l}" data-n="${n}">${m}</a>`);
+    .replace(/\bL(\d+)[ \/]N(\d+)\b/g, (m, l, n) => `<a class="nref" data-l="${l}" data-n="${n}">${m}</a>`);
 }
 function md(src) {
   const out = []; let list = false;
@@ -757,13 +777,13 @@ function md(src) {
 }
 const EMPTY = `<div class="a-empty dim">Ask anything about the model, or open a neuron and press <b>explain</b>.</div>`;
 // the conversation persists in this browser: chat id (= claude session, resumed server side) and the rendered thread
-const AGENT_KEY = "explorer.agent";
+const agentKey = () => `synapse.agent.${index.model_key}.${$("#agent-provider").value}.${$("#agent-model").value.trim()}`;
 function saveAgent() {
-  try { localStorage.setItem(AGENT_KEY, JSON.stringify({ chat: agent.chat, html: $("#a-thread").innerHTML })); } catch {}
+  try { localStorage.setItem(agentKey(), JSON.stringify({ chat: agent.chat, html: $("#a-thread").innerHTML })); } catch {}
 }
 function loadAgent() {
   try {
-    const v = JSON.parse(localStorage.getItem(AGENT_KEY) || "null"); if (!v) return;
+    const v = JSON.parse(localStorage.getItem(agentKey()) || "null"); if (!v) return;
     agent.chat = v.chat; $("#a-thread").innerHTML = v.html || EMPTY;
     $("#a-thread").querySelectorAll("#a-usename, .a-msg.queued, .a-busy").forEach(b => b.remove());
     $("#a-thread").scrollTop = $("#a-thread").scrollHeight;
@@ -862,8 +882,9 @@ async function agentTurn(message, shown, shownCls = "user", atts = []) {
   const stick = () => { th.scrollTop = th.scrollHeight; };
   setSendMode(true);
   try {
-    const body = { chat: agent.chat, message, attachments: atts.map(a => a.id), ...(f && f.kind === "neuron" ? { layer: f.layer, n: f.n } : {}) };
+    const body = { chat: agent.chat, message, provider: $("#agent-provider").value, agent_model: $("#agent-model").value.trim() || null, attachments: atts.map(a => a.id), ...(f && f.kind === "neuron" ? { layer: f.layer, n: f.n } : {}) };
     const r = await fetch("/api/agent/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctl.signal });
+    if (!r.ok) throw new Error(await r.text());
     const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
     for (;;) {
       const { value, done } = await rd.read(); if (done) break;
@@ -984,6 +1005,7 @@ function lastTurn() {
 }
 function addTurnControls() {
   clearTurnControls();
+  if ($("#agent-provider").value === "codex") return;
   const t = lastTurn(); if (!t) return;
   const uc = document.createElement("div"); uc.className = "a-ctl"; uc.innerHTML = `<button data-act="edit" title="remove this message and its reply, and put it back in the box">edit</button>`;
   t.u.append(uc);
@@ -995,7 +1017,7 @@ async function rewindLast(act) {
   if (agent.ctl) agent.ctl.abort();
   const u = t.u, msg = u.dataset.msg ?? u.childNodes[0]?.textContent ?? "", shown = u.dataset.shown ?? msg;
   const cls = u.dataset.cls || "user", atts = JSON.parse(u.dataset.att || "[]");
-  if (agent.chat) { try { await api("/api/agent/rewind", { chat: agent.chat, text: msg }); } catch {} }
+  if (agent.chat) await api("/api/agent/rewind", { chat: agent.chat, text: msg, provider: $("#agent-provider").value });
   for (const x of [u, ...t.after]) x.remove();
   if (!$("#a-thread").children.length) $("#a-thread").innerHTML = EMPTY;
   if (act === "reroll") agentTurn(msg, shown, cls, atts);
@@ -1016,3 +1038,18 @@ $("#a-form").addEventListener("submit", e => { e.preventDefault(); if (agent.ctl
 $("#a-new").onclick = () => { resetAgent(); clearAgentMarks(); };
 loadAgent(); renderAgentActions();
 syncEdge(); updateInsets();
+
+function changeAgentProvider() {
+  if (agent.ctl) agent.ctl.abort();
+  agent.chat = null; $("#a-thread").innerHTML = EMPTY;
+  $("#a-input").placeholder = $("#agent-provider").value === "codex" ? "Ask Codex…" : "Ask Claude…";
+  loadAgent();
+}
+$("#agent-provider").onchange = changeAgentProvider;
+$("#agent-model").onchange = changeAgentProvider;
+api("/api/agent/providers").then(r => {
+  for (const p of r.providers) {
+    const option = $("#agent-provider").querySelector(`option[value="${p.id}"]`);
+    if (option && !p.installed) { option.disabled = true; option.textContent += " (not installed)"; }
+  }
+});

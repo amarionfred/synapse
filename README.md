@@ -1,61 +1,136 @@
-# neuron explorer
+# Synapse
 
-Steering-first neuron explorer for Qwen3.5-4B. Every MLP neuron in a layer is pushed up and down on a few prompts, every
-rollout is kept, and the explorer lays the results out over a 3D view of the model.
+A workspace for exploring open model internals with a human and a coding agent.
+Forked from [Lyra's neuron-explorer](https://github.com/lyramakesmusic/neuron-explorer).
+It retains the 3D neuron map, per-token activations, logit lens and paired steering,
+adds **Codex CLI alongside Claude Code**, and replaces the Qwen-only loader with
+validated dense-decoder adapters.
 
-![neuron explorer](explorer.png)
+## Start
 
-## Explorer
+Python 3.11+ and [uv](https://docs.astral.sh/uv/) are required. The default lock uses
+CPU PyTorch; choose an appropriate PyTorch build for a GPU installation.
 
-    uv sync
-    uv run python explorer/server.py        # http://localhost:8791
+```bash
+uv sync --extra dev
+python scripts/synapse.py serve --model HuggingFaceTB/SmolLM2-135M-Instruct
+```
 
-Reads sweep runs from `runs/` and per-layer stats from `stats/`, both produced by the sweep below; the caches in
-`explorer/cache/` ship with the repo. Loads Qwen3.5-4B locally (MPS, CUDA or CPU) for live
-steered chat, lens, connections and live inference over your own text.
+Open **http://127.0.0.1:8791**. Click **synapse → Load model for live experiments**,
+or select a neuron and request an activation or steering probe. Loading happens
+on demand. No full sweep or corpus indexing runs on startup.
 
-- **map**: the model's layers in perspective, attention and MLP per layer, one point per neuron. Hover shows a neuron's
-  steer lens and logit lens; click opens it; click a layer's label to view its sheet face-on. `writes` places
-  neurons with similar down-projection columns next to each other.
-- **list**: units ranked by word-cluster mass against random-direction controls; `lens` searches the steer and logit
-  lenses for a token, `fires` runs your text through the model and filters neurons by activation.
-- **neuron**: steered rollouts per prompt and dose, a three-column multi-turn steered chat (−, 0, +), lens and
-  connections, and a name.
-- **embeddings**: UMAP of a layer's rollouts, coloured by neuron, prompt, dose or kind.
-- **Claude** (fourth neuron-panel tab, or the right-edge handle): a chat running the `claude` CLI (installed and
-  logged in) with the explorer as an MCP server (`explorer/agent_mcp.py`). It reads neurons, cones and lenses, runs the
-  live model (steering, activations, next-token logprobs, ablations), moves the map, list and highlights, and has file
-  tools and a shell in your home folder. Its prompt is `explorer/agent_prompt.md` plus `explorer/agent_methodology.md`, and
-  `explorer/agent_prompt.local.md` when present (untracked, for your own additions);
-  `EXPLORER_CLAUDE_MODEL` picks the model. The server answers only pages and tools on this machine.
+The small SmolLM2 checkpoint makes live exploration practical on a CPU laptop.
+It is a working research/demo model, not a substitute for a strong coding model.
+Model downloads require disk space; CPU admission estimates check available RAM.
 
-## Sweep
+On Park's installed machine, the `synapse` command is on PATH:
 
-Runs on a CUDA 13 GPU pod with the steering fork of vLLM ([RhizoNymph/vllm](https://github.com/RhizoNymph/vllm)).
+```bash
+synapse start              # bounded systemd user service; 3 GiB RAM, no swap
+synapse status             # checkpoint, actual loaded state and capabilities
+synapse codex              # interactive Codex with the same explorer MCP tools
+synapse stop
+```
 
-    bash sweep/setup_pod.sh                                   # fork, deps, model; writes /workspace/env.sh
-    python sweep/neuron_stats.py --layers 22 --tokens 2000000 --out stats/q35-4b
-    python sweep/steer_sweep.py --stats stats/q35-4b_L22.npz --design main_rel --dose-unit rel \
-        --neurons all --random-controls 256 --run q35-4b-L22
-    sweep/run_depth.sh "4 9 13 17" 384 64                     # random-subset sweep across several layers
+`start` uses a conservative 3 GiB process limit for this laptop. For a larger
+checkpoint on suitable hardware, use `serve` with an appropriate resource limit.
+Select another model using `--model <Hugging-Face-ID-or-local-folder>` and optionally
+`--revision <commit>`. Stop the existing process first. Selection is remembered
+locally; the **synapse** dialog generates the launch command.
 
-`main_rel` doses are fractions of the median residual norm leaving the layer: {who, snake, orange} × {−0.7, +0.5, +0.8}
-and {free} × {+3}, plus one unsteered baseline per prompt.
+For Lyra's shipped Qwen visualization without weights:
 
-| script | output |
+```bash
+synapse start --author-map
+```
+
+That bundle is an author-provided exhibit. Its calibration and indexes are never
+used for live inference or another checkpoint. Generated data, names and calibration
+are stored separately by checkpoint/revision under `.synapse/models/`.
+
+## Work with Codex
+
+Install and authenticate [Codex CLI](https://learn.chatgpt.com/docs/non-interactive-mode)
+once. Open the **Agent** tab and choose **Codex CLI**. The optional model field
+selects the agent model; it is separate from the local checkpoint being examined.
+The CLI default is used when blank. Claude Code remains available when installed.
+
+Codex gets the explorer's MCP tools, the selected-neuron context, and this workspace.
+It can inspect activations, run paired interventions, select/highlight neurons,
+and write experiment scripts and notes. Tool calls and results appear in the panel.
+Sessions resume across browser/server restarts; a new provider, agent model or
+checkpoint gets separate conversation state. Codex edit/reroll is intentionally
+not exposed as destructive session-file surgery; use **new** for a fresh thread.
+
+The bridge invokes `codex exec --json`, keeps authentication in the existing CLI,
+and uses a workspace-write sandbox. Other globally configured MCP servers are
+disabled for that invocation. The known Synapse research/UI tools are explicitly allowed; shell access remains workspace-scoped. It does not copy credentials into the repository.
+`.codex/config.toml` also makes the MCP available when this project is trusted;
+`synapse codex` supplies its absolute path explicitly.
+
+A newly opened agent thread reads the saved project context. It does not inherit
+some other chat's complete conversation or become that already-running session.
+
+## Compatibility
+
+The adapters inspect module structure, projection orientation and dimensions.
+Unsupported shapes produce an explicit error. A model-family name alone is not
+proof that every variant, quantizer or operation works.
+
+| Backend / architecture | Current scope |
 |---|---|
-| `sweep/neuron_stats.py` | per-neuron activation extremes by sign regime, down columns, residual norms |
-| `sweep/steer_sweep.py` | `runs/<run>.jsonl`: text, token ids, logprobs, top-k per step; optional activation captures |
-| `sweep/rank.py` | `runs/<run>.units.jsonl`: distinctive words, cluster mass, percentile against controls |
-| `sweep/steer_lens.py` | `stats/steer_lens_L{l}.npz`: next-token Δlogprob and KL for ±0.8 pushes on every neuron |
-| `sweep/depth_report.py` | `runs/depth_report.json`: per-layer share of neurons above controls, coherence, top units |
-| `sweep/shift.py` | word-shift score against controls, all words counted |
-| `sweep/merge_runs.py` | joins sharded runs of one layer |
-| `sweep/check_equivalence.py` | HF vs vLLM steering and capture agreement |
-| `sweep/bench.py`, `sweep/peek.py` | throughput conditions; terminal views of a run |
-| `explorer/build_embeddings.py` | `runs/<run>.umap.json` |
-| `explorer/build_layout.py` | `explorer/cache/layout_writes.npz` |
-| `explorer/build_connections.py` | `explorer/cache/connections.npz`: each neuron's 24 strongest direct-path links up and down |
-| `sweep/capture_prefill.py` | `captures/<run>.mlp_in.npy`: MLP input at the last prompt token at the run's capture layers, steered |
+| Dense Transformers: Llama, Mistral, Qwen2/3, Qwen3.5 hybrid, Gemma2, GPT-2, GPT-NeoX, OPT, Phi3 layouts | Activation capture, add/multiply interventions, three-way generation; small actual architecture tests |
+| Final norm + unembedding | Logit lens when the adapter exposes both |
+| Separate gate/up MLP + supported pre-MLP RMSNorm | Direct-path weight heuristic; explicitly reported as a heuristic |
+| Compatible new dense variants | Structural detection, then runtime validation; not a blanket guarantee |
+| MoE, encoder-decoder, nonuniform MLP widths, packed/quantized projections | Need additional adapters/backends; rejected explicitly |
+| GGUF / llama.cpp | Separate local chat baseline; no neuron hooks in this backend yet |
+| Closed API models | Can be research agents; weights and internal neurons are not available |
 
-`research_log.md` holds the findings and reasoning; `NOTES.md` the source notes.
+The hook coordinate is the input to the MLP output projection, after gating or
+activation. Additive doses scale the projection output by a reference residual
+norm. Post-MLP normalization can alter the eventual residual effect. Heads are
+exposed only when their projection layout is validated. See `/api/agent/overview`.
+
+Indexes for a new checkpoint are optional and are never borrowed from Qwen:
+
+```bash
+synapse stop
+synapse index --scale --lens    # explicit work; can be costly for large vocabularies
+synapse start
+```
+
+First-use activation calibration uses a short fixed reference text, clearly
+labelled as such. It is not a corpus percentile. Full activation capture is bounded;
+longer text is limited to the token budget returned by the server. Connection and layout builders now use the selected adapter and checkpoint cache; connection scoring requires a supported gated MLP. UMAP layouts require `uv sync --extra analysis`. Upstream vLLM GPU sweep scripts remain Qwen research utilities, not universal pipelines.
+
+## Research and verification
+
+Read [the research agenda](docs/RESEARCH_AGENDA.md) for experiments, controls and
+what would count as evidence of untapped capability. Style changes, neuron labels
+and colorful graphs do not demonstrate increased intelligence, solved
+interpretability or recursive self-improvement.
+
+```bash
+EXPLORER_NO_MODEL=1 EXPLORER_BUNDLED_CACHE=1 .venv/bin/python -m pytest -q tests
+```
+
+Tests construct small real Transformers architectures without downloading weights.
+They check unchanged baseline outputs, the additive column equation, whole-MLP
+ablation, zero-dose continuation equivalence, cleanup and checkpoint isolation.
+They establish implementation behavior, not capability improvement in trained models.
+Machine-specific receipts and smoke outputs live locally under `evidence/`.
+
+Park's Qwen3.5-4B Q4_K_M and OpenCode installation remains available through
+`qwen-lab chat`; its server has a separate 5 GiB available-RAM gate. The detailed
+initial investigation is saved locally in `PLAYBOOK.md`, with setup decisions in
+`DECISIONS.md`. Model files, chat histories and those machine records are ignored
+by Git.
+
+## Provenance
+
+Upstream revision: `f79b2196e29aacbad89684938baac8d97b172fd1`.
+The [original README](docs/UPSTREAM_README.md), research notes and author caches
+are retained. No LICENSE file was present in the inspected upstream revision;
+this fork does not assign a new license to the author's code or data.

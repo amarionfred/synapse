@@ -103,7 +103,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     const x = layerX(l), mx = x + MLP_DX, ax = x + ATTN_DX, cs = sheetCorners(mx);
     for (let i = 0; i < 4; i++) seg(cs[i], cs[(i + 1) % 4]);
     seg(V(ax, 0, 0), V(ax, SHEET_Y0, 0)); seg(V(mx, 0, 0), V(mx, SHEET_Y0, 0));
-    const full = arch.layer_types[l] === "full_attention", t = full ? 0.3 : 0.1;
+    const full = arch.layer_types[l] !== "linear_attention", t = full ? 0.3 : 0.1;
     const slab = new THREE.Mesh(new THREE.BoxGeometry(t, SHEET * 0.92, SHEET * 0.92), new THREE.MeshBasicMaterial({
       color: full ? 0x8fa6b2 : 0x6f8590, transparent: true, opacity: (full ? 0.075 : 0.045) * BRIGHT, depthWrite: false }));
     slab.position.set(ax, SHEET_Y0 + SHEET / 2, 0);

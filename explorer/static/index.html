@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Neuron Explorer</title>
+<title>Synapse · Neuron Explorer</title>
 <link rel="stylesheet" href="style.css?v=62">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 rx=%223%22 fill=%22%23151515%22/%3E%3Ccircle cx=%228%22 cy=%228%22 r=%222.5%22 fill=%22%23ffd27a%22/%3E%3C/svg%3E">
 <script type="importmap">
@@ -15,6 +15,7 @@
 </head>
 <body>
 <header>
+  <button id="model-open" title="Checkpoint and capabilities">synapse</button>
   <nav id="views">
     <button data-view="map" class="on">map</button>
     <button data-view="embed">embeddings</button>
@@ -27,6 +28,21 @@
   <input id="lens-q" placeholder="search lens" aria-label="search" spellcheck="false" autocomplete="off">
   <span id="status" class="mono"></span>
 </header>
+<dialog id="model-dialog">
+  <form method="dialog"><button class="dialog-close" aria-label="Close model settings">×</button></form>
+  <h2>Synapse</h2>
+  <p id="model-current"></p>
+  <p class="dim" id="model-mode"></p>
+  <button id="model-load">Load model for live experiments</button>
+  <pre id="model-capabilities"></pre>
+  <h3>Use another checkpoint</h3>
+  <label>Hugging Face model ID or local checkpoint folder<input id="model-choice" autocomplete="off" spellcheck="false"></label>
+  <p class="dim">Stop the current server, then run this command in a terminal. Each checkpoint has separate data.</p>
+  <pre id="model-command"></pre>
+  <button id="model-copy">Copy launch command</button>
+  <p class="dim">Dense decoder adapters cover common Llama, Qwen, Mistral, Gemma, GPT-2, GPT-NeoX, OPT and Phi layouts. Module shapes are checked on load. MoE, packed weights and closed model internals need other backends.</p>
+  <p class="dim">The installed Qwen GGUF runs separately through <code>qwen-lab chat</code>. Its internal neurons are not exposed by this Transformers backend.</p>
+</dialog>
 
 <main>
   <section id="map-view" class="view on">
@@ -77,7 +93,7 @@
   <button id="list-tab" class="tab-edge left" aria-label="show list">›</button>
   <button id="focus-tab" class="tab-edge right mono" aria-label="show neuron"></button>
   <aside id="focus" class="float">
-    <nav id="tabs"><button data-tab="examples" class="on">Examples</button><button data-tab="chat">Chat</button><button data-tab="details">Details</button><button data-tab="claude">Claude</button><button id="a-new" class="mono dim" title="start a new conversation">new</button><button id="f-collapse" class="edge" aria-label="collapse">›</button></nav>
+    <nav id="tabs"><button data-tab="examples" class="on">Examples</button><button data-tab="chat">Chat</button><button data-tab="details">Details</button><button data-tab="claude">Agent</button><button id="a-new" class="mono dim" title="start a new conversation">new</button><button id="f-collapse" class="edge" aria-label="collapse">›</button></nav>
     <div id="tab-examples" class="tab on"></div>
     <div id="tab-chat" class="tab">
       <div id="c-lens"></div>
@@ -95,10 +111,11 @@
     </div>
     <div id="tab-details" class="tab"></div>
     <div id="tab-claude" class="tab">
+      <div id="agent-settings"><select id="agent-provider" aria-label="Agent provider"><option value="codex">Codex CLI</option><option value="claude">Claude Code</option></select><input id="agent-model" aria-label="Agent model" placeholder="CLI default model" spellcheck="false" title="Agent model, separate from the checkpoint being studied. Changing it starts a new conversation."></div>
       <div id="a-thread"><div class="a-empty dim">Ask anything about the model, or open a neuron and press <b>explain</b>.</div></div>
       <div id="a-actions"></div>
       <div id="a-files"></div>
-      <form id="a-form"><button id="a-attach" type="button" title="attach files (or drop / paste them)" aria-label="attach">📎</button><input id="a-file" type="file" multiple hidden><textarea id="a-input" rows="1" placeholder="Ask Claude…" title="while Claude works: Enter interrupts and sends, ⌘/Ctrl+Enter queues" spellcheck="false"></textarea><button id="a-send" type="submit" aria-label="send">↑</button></form>
+      <form id="a-form"><button id="a-attach" type="button" title="attach files (or drop / paste them)" aria-label="attach">📎</button><input id="a-file" type="file" multiple hidden><textarea id="a-input" rows="1" placeholder="Ask Codex…" title="Enter sends, Shift+Enter adds a line, Ctrl+Enter queues" spellcheck="false"></textarea><button id="a-send" type="submit" aria-label="send">↑</button></form>
     </div>
   </aside>
 </main>

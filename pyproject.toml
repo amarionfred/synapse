@@ -1,16 +1,25 @@
 [project]
-name = "neuron-explorer"
-version = "0.1.0"
+name = "synapse-neuron-explorer"
+version = "0.2.0"
 requires-python = ">=3.11"
 dependencies = [
-    "torch",
-    "transformers",
+    "torch>=2.10,<3",
+    "transformers>=5.5,<6",
     "safetensors",
     "numpy",
-    "datasets",
     "accelerate",
     "fastapi>=0.146.0",
     "uvicorn>=0.54.0",
-    "sentence-transformers>=6.1.0",
-    "umap-learn>=0.5.12",
 ]
+
+[project.optional-dependencies]
+analysis = ["datasets", "sentence-transformers>=6.1.0", "umap-learn>=0.5.12"]
+dev = ["pytest", "httpx"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

@@ -18,3 +18,16 @@ explorer/cache/agent/
 *.zip
 explorer/names.json
 explorer/*.local.md
+
+# Local Synapse installations, private conversations, and machine records
+.synapse/
+models/
+downloads/
+runtime/
+evidence/
+sources/
+PLAYBOOK.md
+DECISIONS.md
+docs/LOCAL_SETUP.md
+.pytest_cache/
+*.pyc

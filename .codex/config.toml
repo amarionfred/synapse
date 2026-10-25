@@ -1,0 +1,12 @@
+# Relative paths resolve from this trusted workspace. `synapse codex` also supplies
+# an explicit absolute path, so it works before project configuration is trusted.
+[mcp_servers.synapse]
+command = "python3"
+args = ["explorer/agent_mcp.py"]
+required = true
+tool_timeout_sec = 900
+enabled_tools = ["overview", "neuron", "rollouts", "cone", "web_summary", "search_lens", "top_units", "set_name", "names", "steer", "activations", "compare", "logprobs", "top_firing", "select_neuron", "highlight_neurons", "show_text", "show_search", "camera", "annotate_neurons", "open_tab"]
+default_tools_approval_mode = "approve"
+
+[mcp_servers.synapse.env]
+EXPLORER_URL = "http://127.0.0.1:8791"

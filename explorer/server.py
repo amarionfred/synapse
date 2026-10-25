@@ -15,24 +15,26 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from transformers import AutoConfig
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rank import compute_units  # noqa: E402
 from runtime import NO_MODEL, Runtime  # noqa: E402
+from model_config import MODEL, ARCH, CACHE, STATE, MODEL_KEY, IDENTITY, BUNDLED
+import codex_agent
 
-RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
-NAMES = os.path.join(ROOT, "explorer", "names.json")
+RUNS, STATS = str(STATE / "runs"), str(STATE / "stats")
+NAMES = str(STATE / "names.json")
 PORT = int(os.environ.get("PORT", 8791))
-_cfg = AutoConfig.from_pretrained("Qwen/Qwen3.5-4B").get_text_config()
-ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter": _cfg.intermediate_size,
-        "layer_types": list(_cfg.layer_types), "attn_heads": _cfg.num_attention_heads,
-        "kv_heads": _cfg.num_key_value_heads, "linear_k_heads": _cfg.linear_num_key_heads,
-        "linear_v_heads": _cfg.linear_num_value_heads}
 
 app = FastAPI()
+
+
+@app.exception_handler(ValueError)
+@app.exception_handler(RuntimeError)
+async def model_error(request, exc):
+    return JSONResponse({"error": str(exc)}, status_code=422)
 
 
 # only this machine's own pages and tools: a page on another site (or a DNS name rebound to 127.0.0.1) can't reach
@@ -145,7 +147,8 @@ def names():
 @app.get("/api/index")
 def index():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH,
+    return {"model": MODEL, "arch": ARCH, "identity": IDENTITY, "model_key": MODEL_KEY,
+            "cache_only": NO_MODEL, "bundled": BUNDLED, "runtime": rt.capabilities(),
             "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())}, "status": rt.status}
 
 
@@ -184,6 +187,7 @@ def unit(layer: int, n: int, kind: str = "neuron"):
 @app.post("/api/name")
 async def set_name(req: Request):
     body = await req.json()
+    rt.validate_coordinate(int(body["layer"]), int(body["n"]))
     nm = names()
     key = f"L{int(body['layer'])}/N{int(body['n'])}"
     if body.get("name", "").strip():
@@ -279,7 +283,7 @@ async def steer(req: Request):
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
-LENS_INDEX = os.path.join(ROOT, "explorer", "cache", "lens_index.npz")
+LENS_INDEX = os.path.join(CACHE, "lens_index.npz")
 _lens = {}
 
 
@@ -327,8 +331,9 @@ async def search(q: str, limit: int = 300):
     return {"ready": True, "results": res, "tokens": int(len(match)), "total": len(out)}
 
 
-ACT_SCALE = os.path.join(ROOT, "explorer", "cache", "act_scale.npz")
-MAX_INFER_TOKENS = 1024  # [32, T, 9216] float32 activations plus scores: about 2.4 GB at this length
+ACT_SCALE = os.path.join(CACHE, "act_scale.npz")
+# Bound full capture + scores + temporaries to roughly 128 MiB.
+MAX_INFER_TOKENS = min(256, max(2, (128 << 20) // (ARCH["n_layers"] * ARCH["inter"] * 16)))
 
 
 @app.get("/api/fires")
@@ -365,7 +370,11 @@ _infer = {}
 async def score_text(text, chat=False):
     """Every neuron's activation at every token of `text` ([L, T, N]) and its signed score: the positive side as a
     multiple of the neuron's typical max, the negative side of its typical min (act_scale.npz)."""
+    await asyncio.to_thread(rt.ensure_loaded)
+    await asyncio.to_thread(rt.ensure_act_scale)
     ids = rt.chat_ids(text) if chat else rt.tok(text).input_ids
+    if not ids:
+        raise ValueError("Enter text containing at least one token")
     ids = ids[:MAX_INFER_TOKENS]
     acts = await asyncio.to_thread(rt.full_activations, ids)  # [L, T, N]
     sc = np.load(ACT_SCALE)
@@ -382,7 +391,7 @@ async def score_text(text, chat=False):
 async def infer(req: Request):
     """Runs text through the model and keeps every neuron's activation at every token for /api/infer/view."""
     b = await req.json()
-    if not os.path.exists(ACT_SCALE) or rt.tok is None:
+    if NO_MODEL:
         return {"ready": False}
     ids, acts, score = await score_text(b["text"], b.get("chat", False))
     units = rt.token_units(ids)
@@ -390,7 +399,8 @@ async def infer(req: Request):
     _infer.clear()
     _infer.update(ids=ids, toks=[units[unit_of[i]][0] for i in range(len(ids))], acts=acts, score=score)
     # one chip per unit; clicking it selects the unit's last token (the one that completes the character)
-    return {"ready": True, "tokens": [u[0] for u in units], "pos": [u[1][-1] for u in units]}
+    return {"ready": True, "tokens": [u[0] for u in units], "pos": [u[1][-1] for u in units],
+            "max_tokens": MAX_INFER_TOKENS, "calibration": rt.calibration_info()}
 
 
 @app.get("/api/infer/view")
@@ -452,6 +462,8 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
     N = S.shape[1]
     active = {(int(i // N), int(i % N)) for i in cand}
     ci = rt.con_index()
+    if ci is None:
+        return Response(b"", media_type="application/octet-stream", headers={"X-Web-Total": "0"})
     rows = []
     for l, n in active:
         for i in range(ci["k"]):
@@ -462,19 +474,21 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
             if t in active:
                 push = int(ci["down_sign"][l, n, i]) * (1 if S[l, n] > 0 else -1)
                 rows.append((l, n, *t, round(z * 10) * push, 1))
-    out = np.array(rows, np.int16).reshape(-1, 6)
+    out = np.array(rows, np.int32).reshape(-1, 6)
     return Response(out.tobytes(), media_type="application/octet-stream",
                     headers={"X-Web-Total": str(len(out)), "X-Active": str(len(active))})
 
 
 @app.get("/api/layout")
 def layout(kind: str = "writes"):
-    """Seriated grid layout: cell index (row * side + col) for every neuron, base64 int16, layer-major."""
+    """Seriated grid layout: cell index (row * side + col) for every neuron, base64 int32, layer-major."""
     import base64
-    path = os.path.join(ROOT, "explorer", "cache", f"layout_{kind}.npz")
+    if kind not in {"writes", "reads", "index"}:
+        raise ValueError("Unknown layout")
+    path = os.path.join(CACHE, f"layout_{kind}.npz")
     if not os.path.exists(path):
         return {"available": False}
-    cell = np.load(path)["cell"].astype(np.int16)
+    cell = np.load(path)["cell"].astype(np.int32)
     return {"available": True, "shape": list(cell.shape), "cell": base64.b64encode(cell.tobytes()).decode()}
 
 
@@ -485,6 +499,8 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
     Rows: src layer, src neuron, dst layer, dst neuron, z * sign, hop (positive downstream, negative upstream)."""
     ci = rt.con_index()
     out = []
+    if ci is None:
+        return out
     for side, step in (("down", 1), ("up", -1)):
         zs, ls, ns, sg = ci[f"{side}_z"], ci[f"{side}_layer"], ci[f"{side}_n"], ci[f"{side}_sign"]
         front, seen, hop, start = [(layer, n)], {(layer, n)}, 1, len(out)
@@ -508,9 +524,9 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
 
 @app.get("/api/web")
 def web(layer: int, n: int, first: int = 5, k: int = 2, zmin: float = 15, cap: int = 20000, hops: int = 0):
-    """The cone for the map. Binary int16, 6 per link: src layer, src neuron, dst layer, dst neuron,
+    """The cone for the map. Binary int32, 6 per link: src layer, src neuron, dst layer, dst neuron,
     round(10 * z) * sign, hop."""
-    rows = np.array([(*r[:4], round(r[4] * 10), r[5]) for r in cone_links(layer, n, k, zmin, cap, first, hops or None)], np.int16).reshape(-1, 6)
+    rows = np.array([(*r[:4], round(r[4] * 10), r[5]) for r in cone_links(layer, n, k, zmin, cap, first, hops or None)], np.int32).reshape(-1, 6)
     return Response(rows.tobytes(), media_type="application/octet-stream", headers={"X-Web-Total": str(len(rows))})
 
 
@@ -529,6 +545,11 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
     `held_by` (the pole that inhibits it)."""
     st = rt.steer_index() if src == "steer" else None
     lens = st if st is not None else rt.lens_index()
+    if lens is None or rt.con_index() is None:
+        return {"src": "unavailable", "links": 0,
+                "down": {"neurons": 0, "toward": [], "away": []},
+                "up": {"neurons": 0, "fed_by": [], "held_by": []},
+                "reason": "This checkpoint has no precomputed connection/lens indexes"}
     v = rt.vocab_strings()
     key_src = "steer" if st is not None else "logit"
     if _idf.get("src") != key_src:
@@ -581,7 +602,7 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
 # Each chat is a `claude -p` session resumed turn by turn. Its tools come from agent_mcp.py, which reads through the
 # endpoints below and sends map actions back through /api/agent/ui into the chat's event stream.
 AGENT_PROMPT = os.path.join(ROOT, "explorer", "agent_prompt.md")
-AGENT_DIR = os.path.join(ROOT, "explorer", "cache", "agent")  # claude's cwd, so no project settings or CLAUDE.md apply
+AGENT_DIR = os.path.join(ROOT, ".synapse", "agents")
 _chats = {}
 _act = {}
 
@@ -593,14 +614,16 @@ def act_range(layer, n):
     if "pos" not in _act:
         return None
     return {"act_max": round(float(_act["pos"][layer, n]), 3), "act_min": round(float(_act["neg"][layer, n]), 3),
-            "over_tokens": _act["tokens"], "source": "FineWeb-Edu"}
+            "over_tokens": _act["tokens"], "source": rt.calibration_info()}
 
 
 @app.get("/api/agent/overview")
 def agent_overview():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH, "layers_with_sweeps": sorted(runs),
-            "named_neurons": len(names()), "live_model": not NO_MODEL}
+    return {"model": MODEL, "arch": ARCH, "identity": IDENTITY, "model_key": MODEL_KEY,
+            "layers_with_sweeps": sorted(runs), "named_neurons": len(names()), "live_model_enabled": not NO_MODEL,
+            "status": rt.status, "runtime": rt.capabilities(), "calibration": rt.calibration_info(),
+            "indexes": {"lens": os.path.exists(LENS_INDEX), "connections": rt.con_index() is not None}}
 
 
 @app.get("/api/agent/names")
@@ -809,7 +832,7 @@ async def agent_fires(req: Request):
         sg = "+" if S[l, n] > 0 else "-"
         res.append({"neuron": f"L{l} N{n}", "pole": sg, "score": round(float(abs(S[l, n])), 2),
                     "act": round(float(acts[l, pos, n]), 3), "name": nm.get(f"L{l}/N{n}") or None,
-                    "steer": [v[t] for t in st["up" if sg == "+" else "down"][l, n, :6]]})
+                    "steer": [v[t] for t in st["up" if sg == "+" else "down"][l, n, :6]] if st else []})
     return {"tokens": toks, "at": pos, "token": toks[pos],
             "note": "score = activation / the neuron's typical extreme on that side; 1 = as strong as its usual max",
             "neurons": res}
@@ -877,7 +900,7 @@ def agent_prompt_file():
     """agent_prompt.md, then agent_methodology.md and agent_prompt.local.md when present, with {ROOT} filled in as
     this checkout's path, written beside the chat's working files."""
     text = open(AGENT_PROMPT).read()
-    for extra in (AGENT_METHOD, AGENT_LOCAL):
+    for extra in ((AGENT_METHOD, AGENT_LOCAL) if BUNDLED else (AGENT_LOCAL,)):
         if os.path.exists(extra):
             text = text.rstrip() + "\n\n" + open(extra).read()
     text = text.replace("{ROOT}", ROOT)
@@ -930,6 +953,8 @@ async def agent_rewind(req: Request):
     import shutil
     import time
     b = await req.json()
+    if b.get("provider", "codex") == "codex":
+        return JSONResponse({"error": "Codex sessions are retained. Start a new conversation to branch from a revised prompt."}, status_code=409)
     sid, text = b["chat"], (b.get("text") or "").strip()
     path = _session_file(sid)
     if not path:
@@ -962,9 +987,29 @@ async def agent_chat(req: Request):
     tool, tool_result, ui, done, error."""
     import uuid
     b = await req.json()
+    provider = b.get("provider", "codex")
+    if provider not in {"codex", "claude"}:
+        raise ValueError("Agent provider must be codex or claude")
+    cid = codex_agent.valid_chat(b.get("chat"))
+    c = _chats.setdefault(cid, {"session": cid, "provider": provider, "model_key": MODEL_KEY})
+    if c.get("provider") != provider or c.get("model_key") != MODEL_KEY:
+        raise ValueError("Start a new conversation when changing provider or checkpoint")
+    if c.get("proc") is not None and c["proc"].returncode is None:
+        await _stop_turn(c["proc"])
+    if provider == "codex":
+        os.makedirs(AGENT_DIR, exist_ok=True)
+        c["queue"] = asyncio.Queue()
+        attachments = []
+        for fid in b.get("attachments") or []:
+            fid = os.path.basename(str(fid))
+            path = os.path.join(UPLOADS, f"{fid}.json")
+            if os.path.exists(path):
+                meta = json.load(open(path))
+                attachments.append(os.path.join(UPLOADS, f"{fid}-{meta['name']}"))
+        prompt = open(agent_prompt_file()).read() + "\nCurrent checkpoint: " + json.dumps(agent_overview())
+        return StreamingResponse(codex_agent.stream(b, ROOT, PORT, cid, c, prompt, _stop_turn, attachments, MODEL_KEY),
+                                 media_type="application/x-ndjson")
     # the chat id is the claude session id, so a chat the browser kept survives server restarts (it resumes)
-    cid = b.get("chat") or str(uuid.uuid4())
-    c = _chats.setdefault(cid, {"session": cid})
     c["queue"] = q = asyncio.Queue()
     msg = b["message"]
     if b.get("layer") is not None:
@@ -977,9 +1022,9 @@ async def agent_chat(req: Request):
            "--system-prompt-file", agent_prompt_file(), "--mcp-config", json.dumps(mcp), "--strict-mcp-config",
            # file tools and a shell, so it can run scripts against this server (e.g. score a file it shouldn't read)
            "--tools", *FILE_TOOLS, "--allowedTools", "mcp__explorer", *FILE_TOOLS,
-           "--add-dir", os.path.expanduser("~"), "--setting-sources", "project"]
-    if os.environ.get("EXPLORER_CLAUDE_MODEL"):
-        cmd += ["--model", os.environ["EXPLORER_CLAUDE_MODEL"]]
+           "--add-dir", ROOT, "--setting-sources", "project"]
+    if b.get("agent_model") or os.environ.get("EXPLORER_CLAUDE_MODEL"):
+        cmd += ["--model", b.get("agent_model") or os.environ["EXPLORER_CLAUDE_MODEL"]]
 
     async def events():
         # a turn that was interrupted may still be exiting; it holds the session until it does
@@ -1049,7 +1094,20 @@ async def agent_chat(req: Request):
 
 @app.get("/api/status")
 def status():
-    return {"status": rt.status}
+    return {"status": rt.status, "model": MODEL, "model_key": MODEL_KEY, "runtime": rt.capabilities()}
+
+
+@app.get("/api/agent/providers")
+def agent_providers():
+    import shutil
+    return {"default": "codex", "providers": [{"id": p, "installed": bool(shutil.which(p))} for p in ("codex", "claude")]}
+
+
+@app.post("/api/model/load")
+async def model_load():
+    await asyncio.to_thread(rt.ensure_loaded)
+    await asyncio.to_thread(rt.ensure_act_scale)
+    return agent_overview()
 
 
 app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), html=True), name="static")
@@ -1058,16 +1116,15 @@ app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), h
 def preload():
     def go():
         if NO_MODEL:
-            rt.status = "no model"
-            rt.vocab_strings()
+            rt.status = "cache only"
             return
-        rt.ensure_loaded()
-        if not os.path.exists(LENS_INDEX):
-            os.makedirs(os.path.dirname(LENS_INDEX), exist_ok=True)
-            rt.build_lens_index(LENS_INDEX)
-        rt.vocab_strings()
-        if not os.path.exists(ACT_SCALE):
-            rt.build_act_scale(ACT_SCALE)
+        if os.getenv("EXPLORER_PRELOAD") == "1":
+            try:
+                rt.ensure_loaded()
+                rt.ensure_act_scale()
+            except Exception:
+                import traceback
+                traceback.print_exc()
     threading.Thread(target=go, daemon=True).start()
 
 
