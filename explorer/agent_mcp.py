@@ -15,27 +15,26 @@ LN = {"layer": {"type": "integer", "description": "zero-based layer; bounds from
 TOOLS = [
     {"name": "overview", "description": "Model architecture and which layers have sweep runs (rollouts and rankings).",
      "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "neuron", "description": "Everything cached for one neuron: name, logit lens and steer lens (with KL) for "
+    {"name": "neuron", "description": "Inspect one neuron, computing supported live data on demand: name, logit lens and steer lens (with KL) for "
      "both poles, activation range, sweep rank if any, and its 24 strongest direct-path links each way (writes_into, "
-     "reads_from) with each linked neuron's steer lens, top words and name.",
+     "reads_from) with each linked neuron's available lens labels, top words and name.",
      "inputSchema": {"type": "object", "properties": LN, "required": ["layer", "n"]}},
     {"name": "rollouts", "description": "Sweep rollouts for a neuron: steered text per prompt and dose beside the "
      "unsteered baselines, distinctive words and stats. Empty when the layer has no sweep run.",
      "inputSchema": {"type": "object", "properties": {**LN, "max_chars": {"type": "integer", "default": 500}},
                      "required": ["layer", "n"]}},
     {"name": "cone", "description": "The neuron's connection cone: links chained forward (downstream) and backward "
-     "(upstream), first hop all links, later hops each node's top k. Returns the neurons reached with hop, best z and "
-     "steer lens. Multi-hop paths are weight-only guesses: leads to check, not circuits.",
+     "(upstream), following top k links. GGUF computes/caches weights on demand with 1..3 hops and a reported expansion limit. Returns the neurons reached with hop, best z and "
+     "lens labels. Multi-hop paths are weight-only guesses: leads to check, not circuits.",
      "inputSchema": {"type": "object", "properties": {**LN, "k": {"type": "integer", "default": 2},
-                                                       "limit": {"type": "integer", "default": 120}},
+                                                       "limit": {"type": "integer", "default": 120}, "hops": {"type":"integer","minimum":1,"maximum":3,"default":1}},
                      "required": ["layer", "n"]}},
     {"name": "web_summary", "description": "The token summary of the neuron's web, the same one the person sees in the "
-     "left panel: steer-lens tokens pooled over its cone, each connected neuron read on the pole the chain drives, ranked "
-     "by lift over that layer's base rate. `toward` / `away`: what its downstream neurons push the model toward and away "
+     "left panel: lens tokens pooled over its cone, each connected neuron read on the pole the chain drives. The response states the ranking: indexed layerwise lift or on-demand weighted token counts. `toward` / `away`: what its downstream neurons push the model toward and away "
      "from when this neuron fires (indirect effect). `fed_by` / `held_by`: what its upstream writers say when they "
      "excite / inhibit it (its inputs). Each token has n (neurons carrying it) and a score.",
      "inputSchema": {"type": "object", "properties": {**LN, "first": {"type": "integer", "default": 5},
-                                                       "k": {"type": "integer", "default": 2}},
+                                                       "k": {"type": "integer", "default": 2}, "hops": {"type":"integer","minimum":1,"maximum":3,"default":1}},
                      "required": ["layer", "n"]}},
     {"name": "search_lens", "description": "Neurons whose logit lens or steer lens (top 12, either pole) contains a token "
      "matching the query (case-insensitive substring). Best matches first.",
@@ -180,11 +179,12 @@ def call(name, a):
                 r["text"] = r["text"][:cut]
         return u
     if name == "cone":
-        return get("/api/agent/cone", layer=a["layer"], n=a["n"], k=a.get("k", 2), limit=a.get("limit", 120))
+        return get("/api/agent/cone", layer=a["layer"], n=a["n"], k=a.get("k", 2), limit=a.get("limit", 120), hops=a.get("hops",1))
     if name == "web_summary":
-        r = get("/api/web/summary", layer=a["layer"], n=a["n"], first=a.get("first", 5), k=a.get("k", 2), top=20)
+        r = get("/api/web/summary", layer=a["layer"], n=a["n"], first=a.get("first", 5), k=a.get("k", 2), top=20, hops=a.get("hops",1))
         slim = lambda lst: [f"{t['tok']} ({t['n']})" for t in lst]
         return {"lens": r["src"], "links": r["links"],
+                "ranking":r.get("ranking","layerwise lift"),"hops":r.get("hops"),"truncated":r.get("truncated",False),
                 "downstream_neurons": r["down"]["neurons"], "toward": slim(r["down"]["toward"]), "away": slim(r["down"]["away"]),
                 "upstream_neurons": r["up"]["neurons"], "fed_by": slim(r["up"]["fed_by"]), "held_by": slim(r["up"]["held_by"])}
     if name == "search_lens":

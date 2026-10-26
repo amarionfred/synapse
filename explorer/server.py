@@ -230,7 +230,7 @@ async def connections(layer: int, n: int, k: int = 24, lens: int = 5):
 
 @app.get("/api/hover")
 async def hover(layer: int, n: int):
-    con = await asyncio.to_thread(rt.connections, layer, n, 16, 0)
+    con = await asyncio.to_thread(rt.cached_connections, layer, n, 16) if hasattr(rt, "cached_connections") else await asyncio.to_thread(rt.connections, layer, n, 16, 0)
     lens = await asyncio.to_thread(rt.lens, layer, n, 8)
     return {"lens": lens["up"], "lens_neg": lens["down"], "steer": lens.get("steer_up"), "steer_neg": lens.get("steer_down"),
             "con": con}
@@ -499,6 +499,8 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
     and everything that writes into it, back to layer 0. Each side only moves one way. The first hop takes all of the
     neuron's top `first` links (all when None), later hops each node's top k with z >= zmin, up to `hops` hops; each side keeps at most cap / 2 links.
     Rows: src layer, src neuron, dst layer, dst neuron, z * sign, hop (positive downstream, negative upstream)."""
+    if hasattr(rt, "connection_graph"):
+        return rt.connection_graph(layer,n,first or 5,k,hops or 1,zmin,builtins.min(cap,500))["links"]
     ci = rt.con_index()
     out = []
     if ci is None:
@@ -528,8 +530,14 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
 def web(layer: int, n: int, first: int = 5, k: int = 2, zmin: float = 15, cap: int = 20000, hops: int = 0):
     """The cone for the map. Binary int32, 6 per link: src layer, src neuron, dst layer, dst neuron,
     round(10 * z) * sign, hop."""
-    rows = np.array([(*r[:4], round(r[4] * 10), r[5]) for r in cone_links(layer, n, k, zmin, cap, first, hops or None)], np.int32).reshape(-1, 6)
-    return Response(rows.tobytes(), media_type="application/octet-stream", headers={"X-Web-Total": str(len(rows))})
+    if hasattr(rt, "connection_graph"):
+        graph = rt.connection_graph(layer,n,first,k,hops or 1,zmin,builtins.min(cap,500))
+        links = graph["links"]
+        headers = {"X-Web-Mode":"on-demand", "X-Web-Hops":str(graph["hops"]), "X-Web-Truncated":str(int(graph["truncated"]))}
+    else:
+        links,headers = cone_links(layer,n,k,zmin,cap,first,hops or None),{}
+    rows = np.array([(*r[:4], round(r[4] * 10), r[5]) for r in links], np.int32).reshape(-1, 6)
+    return Response(rows.tobytes(), media_type="application/octet-stream", headers={**headers,"X-Web-Total": str(len(rows))})
 
 
 _idf = {}
@@ -545,6 +553,8 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
     Downstream gives
     `toward` (the driven pole) and `away` (the opposite pole); upstream gives `fed_by` (the pole that excites it) and
     `held_by` (the pole that inhibits it)."""
+    if hasattr(rt, "connection_summary"):
+        return rt.connection_summary(layer,n,first,k,hops or 1,builtins.min(100,top))
     st = rt.steer_index() if src == "steer" else None
     lens = st if st is not None else rt.lens_index()
     if lens is None or rt.con_index() is None:
@@ -625,7 +635,9 @@ def agent_overview():
     return {"model": MODEL, "arch": ARCH, "identity": IDENTITY, "model_key": MODEL_KEY,
             "layers_with_sweeps": sorted(runs), "named_neurons": len(names()), "live_model_enabled": not NO_MODEL,
             "status": rt.status, "runtime": rt.capabilities(), "calibration": rt.calibration_info(),
-            "indexes": {"lens": os.path.exists(LENS_INDEX), "connections": rt.con_index() is not None}}
+            "indexes": {"lens": os.path.exists(LENS_INDEX), "connections": rt.con_index() is not None},
+            "connections": {"mode": "on-demand" if hasattr(rt,"connection_graph") else "indexed or on-demand per neuron",
+                            "available": rt.capabilities().get("capabilities",{}).get("weight_connections")}}
 
 
 @app.get("/api/agent/names")
@@ -656,7 +668,22 @@ async def agent_neuron(layer: int, n: int):
 
 
 @app.get("/api/agent/cone")
-def agent_cone(layer: int, n: int, k: int = 2, limit: int = 120):
+def agent_cone(layer: int, n: int, k: int = 2, limit: int = 120, hops: int = 1):
+    if hasattr(rt,"connection_graph"):
+        from connection_graph import reached_nodes
+        graph = rt.connection_graph(layer,n,k,k,hops)
+        reach = reached_nodes(graph["links"],layer,n)
+        selected = sorted(reach,key=lambda c:(abs(reach[c][0]),-reach[c][1],c))[:builtins.min(128,limit)]
+        labels = rt.lens_many(selected,5)
+        nm,per_hop = names(),{}
+        for hop,_,_ in reach.values():
+            per_hop[hop] = per_hop.get(hop,0)+1
+        return {"links":len(graph["links"]),"neurons":len(reach),"per_hop":per_hop,
+                "hops":hops,"truncated":graph["truncated"],"mode":"on-demand",
+                "note":"Direct-path weight alignment from this quantized checkpoint; node labels use the logit lens.",
+                "nodes":[{"neuron":f"L{l} N{m}","hop":reach[(l,m)][0],"z":round(reach[(l,m)][1],2),
+                          "sign":reach[(l,m)][2],"steer_up":labels[(l,m)]["up"],"lens_source":"logit",
+                          "name":nm.get(f"L{l}/N{m}") or None} for l,m in selected]}
     links = cone_links(layer, n, k)
     best = {}
     for sl, sn, dl, dn, z, hop in links:

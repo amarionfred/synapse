@@ -62,15 +62,25 @@ struct Engine {
       throw std::runtime_error("Invalid tensor extent");
     return static_cast<char *>(map) + off;
   }
-  void row(const ggml_tensor *t, int r, float *out) {
+  void row_from(const ggml_tensor *t, const char *base, int r, float *out) {
     auto *traits = ggml_get_type_traits(t->type);
-    auto *src = data(t) + r * t->nb[1];
+    auto *src = base + r * t->nb[1];
     if (t->type == GGML_TYPE_F32)
       memcpy(out, src, t->ne[0] * sizeof(float));
     else if (traits->to_float)
       traits->to_float(src, out, t->ne[0]);
     else
       throw std::runtime_error("No dequantizer for GGUF tensor");
+  }
+  void row(const ggml_tensor *t, int r, float *out) {
+    row_from(t, data(t), r, out);
+  }
+  ggml_tensor *matrix(const std::string &name, int columns, int rows) {
+    auto *t = tensor(name);
+    if (t->ne[0] != columns || t->ne[1] != rows || t->ne[2] != 1 ||
+        t->ne[3] != 1)
+      throw std::runtime_error("Unexpected matrix shape: " + name);
+    return t;
   }
   void column(int layer, int neuron, float *out) {
     if (layer < 0 || layer >= layers || neuron < 0 || neuron >= inter)
@@ -315,6 +325,101 @@ int syn_eval(void *ptr, int *ids, int count, bool reset, bool observe,
 int syn_column(void *ptr, int layer, int neuron, float *out) {
   try {
     static_cast<Engine *>(ptr)->column(layer, neuron, out);
+    return 0;
+  } catch (const std::exception &ex) {
+    error = ex.what();
+    return -1;
+  }
+}
+// Bounded row export for batched lens scoring and independent matrix checks.
+int syn_rows(void *ptr, const char *name, int start, int count, int width,
+             float *out) {
+  try {
+    auto &e = *static_cast<Engine *>(ptr);
+    auto *t = ggml_get_tensor(e.tensors, name);
+    if (!t && std::string(name) == "output.weight")
+      t = e.tensor("token_embd.weight");
+    if (!t || start < 0 || count < 1 || count > 2048 ||
+        int64_t(start) + count > t->ne[1] || width != t->ne[0] ||
+        t->ne[2] != 1 || t->ne[3] != 1)
+      throw std::runtime_error("Invalid weight-row request");
+    const char *base = e.data(t);
+    for (int r = 0; r < count; ++r)
+      e.row_from(t, base, start + r, out + size_t(r) * width);
+    return 0;
+  } catch (const std::exception &ex) {
+    error = ex.what();
+    return -1;
+  }
+}
+// Exact float dot products of the dequantized GGUF weights, matching the
+// Transformers direct-path heuristic. Each output is [layers, neurons].
+// Norm gains in GGUF already include Qwen's +1 conversion; never add 1 again.
+int syn_connections(void *ptr, int layer, int neuron, int size, float *gate_out,
+                    float *up_out) {
+  try {
+    auto &e = *static_cast<Engine *>(ptr);
+    if (size != e.layers * e.inter)
+      throw std::runtime_error("Invalid connection output capacity");
+    std::vector<float> d(e.hidden), gain(e.hidden), rg(e.hidden), ru(e.hidden);
+    std::vector<float> row(std::max(e.inter, e.hidden)), v(e.hidden);
+    e.column(layer, neuron, d.data()); // validates the coordinate first
+    const auto prefix = "blk." + std::to_string(layer) + ".";
+    e.row(e.matrix(prefix + "post_attention_norm.weight", e.hidden, 1), 0,
+          gain.data());
+    e.row(e.matrix(prefix + "ffn_gate.weight", e.hidden, e.inter), neuron,
+          rg.data());
+    e.row(e.matrix(prefix + "ffn_up.weight", e.hidden, e.inter), neuron,
+          ru.data());
+    for (int h = 0; h < e.hidden; ++h) {
+      rg[h] *= gain[h];
+      ru[h] *= gain[h];
+    }
+    std::fill(gate_out, gate_out + size, 0.f);
+    std::fill(up_out, up_out + size, 0.f);
+    for (int l = 0; l < e.layers; ++l) {
+      if (l == layer)
+        continue;
+      const auto p = "blk." + std::to_string(l) + ".";
+      float *g = gate_out + size_t(l) * e.inter,
+            *u = up_out + size_t(l) * e.inter;
+      if (l > layer) {
+        e.row(e.matrix(p + "post_attention_norm.weight", e.hidden, 1), 0,
+              gain.data());
+        for (int h = 0; h < e.hidden; ++h)
+          v[h] = d[h] * gain[h];
+        auto *gt = e.matrix(p + "ffn_gate.weight", e.hidden, e.inter);
+        auto *ut = e.matrix(p + "ffn_up.weight", e.hidden, e.inter);
+        const char *gb = e.data(gt), *ub = e.data(ut);
+        for (int n = 0; n < e.inter; ++n) {
+          e.row_from(gt, gb, n, row.data());
+          double dot = 0;
+          for (int h = 0; h < e.hidden; ++h)
+            dot += double(row[h]) * v[h];
+          g[n] = dot;
+          e.row_from(ut, ub, n, row.data());
+          dot = 0;
+          for (int h = 0; h < e.hidden; ++h)
+            dot += double(row[h]) * v[h];
+          u[n] = dot;
+        }
+      } else {
+        auto *dt = e.matrix(p + "ffn_down.weight", e.inter, e.hidden);
+        const char *db = e.data(dt);
+        std::vector<double> gg(e.inter, 0.), uu(e.inter, 0.);
+        for (int h = 0; h < e.hidden; ++h) {
+          e.row_from(dt, db, h, row.data());
+          for (int n = 0; n < e.inter; ++n) {
+            gg[n] += double(row[n]) * rg[h];
+            uu[n] += double(row[n]) * ru[h];
+          }
+        }
+        for (int n = 0; n < e.inter; ++n) {
+          g[n] = gg[n];
+          u[n] = uu[n];
+        }
+      }
+    }
     return 0;
   } catch (const std::exception &ex) {
     error = ex.what();

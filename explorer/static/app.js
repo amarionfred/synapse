@@ -125,6 +125,9 @@ setLayout("writes");
 
 // connection web of the focused neuron: downstream cone forward, upstream cone backward
 const connectionsAvailable = index.runtime?.capabilities?.weight_connections !== false;
+const liveConnections = index.runtime?.connection_mode === "on-demand";
+if (liveConnections) document.querySelector('#web-depth option[value="0"]').remove();
+$("#web-depth").value = String(Number(new URLSearchParams(location.search).get("webhops")) || (liveConnections ? 1 : 0));
 let webOn = connectionsAvailable, webKey = null;
 if (!connectionsAvailable) {
   const on = document.querySelector('#web-mode button[data-w="on"]');
@@ -135,22 +138,33 @@ async function refreshWeb() {
   document.querySelectorAll("#web-mode button").forEach(b => b.classList.toggle("on", (b.dataset.w === "on") === webOn));
   const f = state.focus, first = Math.max(1, Math.min(24, Math.round(Number($("#web-z").value) || 5)));
   const k = Number(new URLSearchParams(location.search).get("webk")) || 2;
-  const hops = Number(new URLSearchParams(location.search).get("webhops")) || 0;  // hops out each way; 0 = all the way
+  const hops = Number($("#web-depth").value);
   if (!webOn || !f || f.kind !== "neuron") { webKey = null; state.webSum = null; map.setWeb(null); renderList(); return; }
   const key = `${f.layer}/${f.n}/${first}/${k}/${hops}`;
   if (key === webKey) return;
   webKey = key;
-  const r = await fetch(`/api/web?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}`);
-  if (!r.ok || webKey !== key) return;
-  $("#web-z").title = `web: the open neuron's top links each way (later hops follow ${k}) · ${r.headers.get("X-Web-Total")} links`;
-  map.setWeb(new Int32Array(await r.arrayBuffer()));
-  const sum = await api(`/api/web/summary?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}&top=24`);
-  if (webKey !== key) return;
-  state.webSum = { ...sum, layer: f.layer, n: f.n, links: r.headers.get("X-Web-Total") };
-  renderList();
+  map.setWeb(null);
+  if (liveConnections) { state.webSum = {layer:f.layer,n:f.n,loading:true}; renderList(); }
+  try {
+    const r = await fetch(`/api/web?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}`);
+    if (!r.ok) throw new Error(await r.text());
+    const edges = new Int32Array(await r.arrayBuffer());
+    if (webKey !== key) return;
+    $("#web-z").title = `web: the open neuron's top links each way (later hops follow ${k}) · ${r.headers.get("X-Web-Total")} links`;
+    map.setWeb(edges);
+    if (liveConnections) { state.webSum = {layer:f.layer,n:f.n,loading:true,message:`${r.headers.get("X-Web-Total")} links ready · reading labels…`}; renderList(); }
+    const sum = await api(`/api/web/summary?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}&top=24`);
+    if (webKey !== key) return;
+    state.webSum = { ...sum, layer: f.layer, n: f.n, links: r.headers.get("X-Web-Total") };
+    renderList();
+  } catch (err) {
+    if (webKey !== key) return;
+    state.webSum = {layer:f.layer,n:f.n,error:err.message}; renderList();
+  }
 }
 document.querySelectorAll("#web-mode button").forEach(b => b.onclick = () => { webOn = b.dataset.w === "on"; webKey = null; refreshWeb(); });
 $("#web-z").onchange = () => refreshWeb();
+$("#web-depth").onchange = () => { webKey = null; refreshWeb(); };
 
 // ---------- scatter ----------
 const scatter = createScatter($("#scatter"), {
@@ -367,10 +381,12 @@ $("#show-random").onchange = renderList;
 function webSummaryHTML() {
   const w = state.webSum, f = state.focus;
   if (!w || !f || f.kind !== "neuron" || w.layer !== f.layer || w.n !== f.n) return "";
+  if (w.loading) return `<p class="dim">${esc(w.message || `Computing links for L${w.layer} N${w.n}…`)}</p>`;
+  if (w.error) return `<p class="dim">Could not compute links: ${esc(w.error)}</p>`;
   if (w.src === "unavailable") return `<p class="dim">${esc(w.reason || "Connection indexes are unavailable for this checkpoint.")}</p>`;
   const chips = list => list.length ? list.map(t => `<span class="chip" data-q="${esc(t.tok)}" title="${t.n} neurons · score ${t.w}">${esc(t.tok)}<i>${t.n}</i></span>`).join("")
     : `<span class="faint">nothing above chance</span>`;
-  return `<div class="head">web of L${w.layer} N${w.n} · ${w.links} links · ${w.src} lens, ranked by lift over each layer</div>
+  return `<div class="head">web of L${w.layer} N${w.n} · ${w.links} links${w.hops ? ` · ${w.hops} hop${w.hops > 1 ? "s" : ""}` : ""} · ${w.src} lens · ${esc(w.ranking || "ranked by lift over each layer")}${w.truncated ? " · expansion limit reached; select a neighbor to continue" : ""}</div>
     <div class="wsum"><div class="lab"><span class="sw up"></span>fed by · ${w.up.neurons} upstream neurons</div><div class="chips">${chips(w.up.fed_by)}</div></div>
     <div class="wsum"><div class="lab"><span class="sw down"></span>held back by</div><div class="chips">${chips(w.up.held_by || [])}</div></div>
     <div class="wsum"><div class="lab"><span class="sw up"></span>feeds → pushes toward · ${w.down.neurons} downstream neurons</div><div class="chips">${chips(w.down.toward)}</div></div>
@@ -575,14 +591,14 @@ async function loadLive(layer, n) {
   $("#d-lens") && ($("#d-lens").textContent = "…");
   $("#d-con") && ($("#d-con").textContent = "…");
   const conP = api(`/api/connections?layer=${layer}&n=${n}&k=24`);
-  let lens;
-  try { lens = await api(`/api/lens?layer=${layer}&n=${n}`); }
-  catch (err) { if (isFocus(layer, n, "neuron") && $("#d-lens")) $("#d-lens").textContent = err.message; }
-  if (!isFocus(layer, n, "neuron")) return;
   conP.then(con => {
     if (!isFocus(layer, n, "neuron")) return;
     map.setConnections(con); state.con = con; renderConnections();
   }, err => { if (isFocus(layer, n, "neuron") && $("#d-con")) $("#d-con").textContent = err.message; });
+  let lens;
+  try { lens = await api(`/api/lens?layer=${layer}&n=${n}`); }
+  catch (err) { if (isFocus(layer, n, "neuron") && $("#d-lens")) $("#d-lens").textContent = err.message; }
+  if (!isFocus(layer, n, "neuron")) return;
   if (!lens) return;
   state.lens = { ...lens, layer, n }; renderList();
   const tok = t => `<span class="tok">${esc(t)}</span>`;

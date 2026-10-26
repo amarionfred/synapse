@@ -22,9 +22,9 @@ for (const k in PAL) if (!["bg", "swept", "lo", "hi", "named"].includes(k)) PAL[
 function glowPoints(sizePx, maxScale = 3) {
   return new THREE.RawShaderMaterial({
     uniforms: { size: { value: sizePx * Math.min(devicePixelRatio, 2) }, ref: { value: 1 }, maxScale: { value: maxScale },
-      focusX: { value: 0 }, fadeW: { value: 1 }, fadeAmt: { value: 0 }, camSide: { value: 1 }, tdist: { value: 1 } },
+      focusX: { value: 0 }, fadeW: { value: 1 }, fadeAmt: { value: 0 }, camSide: { value: 1 }, tdist: { value: 1 }, intensity: { value: 1 } },
     vertexShader: `precision highp float;
-      uniform mat4 modelViewMatrix, projectionMatrix; uniform float size, ref, maxScale, focusX, fadeW, fadeAmt, camSide, tdist;
+      uniform mat4 modelViewMatrix, projectionMatrix; uniform float size, ref, maxScale, focusX, fadeW, fadeAmt, camSide, tdist, intensity;
       attribute vec3 position; attribute vec3 color; varying vec3 vC;
       void main() { float d = (position.x - focusX) / fadeW;
         vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
@@ -37,7 +37,7 @@ function glowPoints(sizePx, maxScale = 3) {
         float keep = mix(1.0, exp(-d * d), fadeAmt * 0.75) * mix(1.0, 1.0 - 0.6 * fadeAmt, front);
         // points nearer than the focus are drawn bigger; dim them by the extra size so they don't outshine it
         float sc = clamp(sqrt(ref / -mv.z), 0.6, maxScale), sc0 = clamp(sqrt(ref / tdist), 0.6, maxScale);
-        vC = color * keep * near * min(1.0, sc0 / sc);
+        vC = color * keep * near * min(1.0, sc0 / sc) * intensity;
         gl_PointSize = size * sc; }`,
     fragmentShader: `precision highp float; varying vec3 vC;
       void main() { float r = length(gl_PointCoord - 0.5); if (r > 0.5) discard;
@@ -171,6 +171,9 @@ export function createMap(canvas, labelsDiv, arch, cb) {
   const DEAD = 0.08;  // brightness of lines the web doesn't continue through
   const DIRECT = 0.6;  // the open neuron's direct links, relative to full brightness
   function buildWeb() {
+    // Hundreds of thousands of additive points otherwise wash out the links
+    // at overview scale. Keep the selected web and its neurons in the foreground.
+    pointMat.uniforms.intensity.value = webEdges?.length ? 0.12 : 1;
     if (!webEdges || !webEdges.length) { webFed.clear(); webFeeds.clear(); webLines.visible = false; webPts.visible = false; return; }
     const m = webEdges.length / 6, p = new Float32Array(m * 6), c = new Float32Array(m * 6);
     let zhi = 1;
@@ -187,16 +190,17 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       const k = e[4] > 0 ? WEB_UP : WEB_DOWN;
       const s0 = nk(e[0], e[1]), d0 = nk(e[2], e[3]);
       const through = (s0 === root || fed.has(s0)) && (d0 === root || feeds.has(d0));
-      const al = WEB_ALPHA * (0.6 + 0.4 * Math.abs(e[4]) / zhi) * Math.max(0.35, WEB_DECAY ** (Math.abs(e[5]) - 1)) * (through ? 1 : DEAD);
+      const direct = s0 === root || d0 === root;
+      const al = WEB_ALPHA * (0.6 + 0.4 * Math.abs(e[4]) / zhi) * Math.max(0.35, WEB_DECAY ** (Math.abs(e[5]) - 1)) * (through || direct ? 1 : DEAD);
       p.set([a.x, a.y, a.z, b.x, b.y, b.z], i * 6); c.set([k.r * al, k.g * al, k.b * al, k.r * al, k.g * al, k.b * al], i * 6);
       // each touched neuron takes the colour of the hop that first reached it (edges arrive in hop order)
       const key = e[5] > 0 ? e[2] * N + e[3] : e[0] * N + e[1];
-      if (!touched.has(key)) touched.set(key, [e[5] > 0 ? b : a, k]);
+      if (!touched.has(key)) touched.set(key, [e[5] > 0 ? b : a, k, direct]);
     }
     // dots too: a neuron the web runs through (read into and out of, or next to the open neuron) at full brightness
     const tp = [], tc = [];
-    for (const [id, [v, k]] of touched) {
-      const f = (fed.has(id) || id === root) && (feeds.has(id) || id === root) ? 1 : DEAD * 3;
+    for (const [id, [v, k, direct]] of touched) {
+      const f = direct || ((fed.has(id) || id === root) && (feeds.has(id) || id === root)) ? 1 : DEAD * 3;
       tp.push(v.x, v.y, v.z); tc.push(k.r * f, k.g * f, k.b * f);
     }
     webPtGeo.setAttribute("position", new THREE.Float32BufferAttribute(tp, 3));

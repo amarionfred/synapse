@@ -3,11 +3,14 @@
 import json
 from pathlib import Path
 import subprocess
+import time
+from collections import Counter
 import numpy as np
 import torch
 from runtime import Runtime, REFERENCE_TEXT
 from model_config import MODEL, ARCH, NO_MODEL
 from llama_bridge import Bridge, Tokenizer
+from connection_graph import rank_connections, walk_connections, reached_nodes
 
 
 class GGUFRuntime(Runtime):
@@ -38,12 +41,15 @@ class GGUFRuntime(Runtime):
                 for line in Path("/proc/meminfo").read_text().splitlines()
             )
             available = int(mem["MemAvailable"].split()[0]) * 1024
+            # The real connection/lens check peaked at 3.7 GiB for the whole
+            # process. Imports already occupy ~0.45 GiB here; 4.25 GiB available
+            # leaves about 1 GiB beyond that measured incremental requirement.
             required = max(
-                int(4.5 * 2**30), Path(MODEL).stat().st_size + int(1.5 * 2**30)
+                int(4.25 * 2**30), Path(MODEL).stat().st_size + int(1.5 * 2**30)
             )
             if available < required:
                 raise RuntimeError(
-                    f"Qwen GGUF needs {required / 2**30:.1f} GiB available before loading; {available / 2**30:.1f} GiB available. Close an unused app and retry."
+                    f"Qwen GGUF needs {(required + 2**20 - 1) // 2**20:,} MiB available before loading; {available // 2**20:,} MiB available. Close an unused app and retry."
                 )
             self.status = "loading GGUF"
             bridge = None
@@ -72,13 +78,19 @@ class GGUFRuntime(Runtime):
                 "additive_steering": True,
                 "multiplicative_steering": True,
                 "logit_lens": True,
-                "weight_connections": False,
+                "weight_connections": True,
                 "attention_heads": [0] * ARCH["n_layers"],
             },
             "dose_units": "median reference residual norm / dequantized output-projection column norm; quantized matmul adds numerical error",
             "context_tokens": 2048,
+            "connection_mode": "on-demand",
+            "connection_hops": {
+                "default": 1,
+                "maximum": 3,
+                "max_expansions_per_request": 12,
+            },
             "generation": "three independent greedy rows, sequential on CPU",
-            "note": "Quantized checkpoint calibration is separate from the author's original Qwen data. Connection heuristics, head ablation and full lens indexing are not implemented for GGUF.",
+            "note": "Connections are computed from this GGUF's gate/up/down weights on selection and cached. Head ablation and whole-model lens indexing are not implemented. Quantized calibration is separate from the author's data.",
         }
 
     def n_heads(self, layer):
@@ -236,26 +248,196 @@ class GGUFRuntime(Runtime):
         yield None, None
 
     def lens(self, layer, n, k=16):
-        self.validate_coordinate(layer, n)
-        self.ensure_loaded()
-        with self.lock:
-            key = (layer, n, k)
-            if key not in self._lens_cache:
-                logits = self.model.lens(layer, n)
-                order = np.argsort(logits)
-                self._lens_cache[key] = {
-                    "up": [self.tok.decode([t]) for t in order[-k:][::-1]],
-                    "down": [self.tok.decode([t]) for t in order[:k]],
+        return self.lens_many([(layer, n)], k)[(layer, n)]
+
+    def _cached(self, key):
+        with self._db_lock:
+            row = self._db.execute(
+                "SELECT val FROM con WHERE key = ?", (key,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def _save(self, key, value):
+        with self._db_lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO con VALUES (?, ?)", (key, json.dumps(value))
+            )
+            self._db.commit()
+
+    def lens_many(self, coordinates, k=16):
+        coords = list(dict.fromkeys(coordinates))
+        if not 1 <= k <= 32 or len(coords) > 128:
+            raise ValueError("Request at most 128 lens directions and 1..32 tokens")
+        for l, n in coords:
+            self.validate_coordinate(l, n)
+        if not coords:
+            return {}
+        with self.lock, torch.inference_mode():
+            result, missing = {}, []
+            for coord in coords:
+                cache_key = f"gguf-lens-f32-v1:{coord[0]}:{coord[1]}"
+                row = self._lens_cache.get(coord) or self._cached(cache_key)
+                if row is None:
+                    missing.append(coord)
+                else:
+                    result[coord] = row
+            if missing:
+                self.ensure_loaded()
+                # Stream the unembedding once for a batch of directions. No full
+                # FP32 checkpoint or whole-model lens index is allocated.
+                directions = torch.from_numpy(
+                    np.stack([self.model.column(*c) for c in missing], axis=1)
+                )
+                gain = torch.from_numpy(
+                    self.model.weight_rows("output_norm.weight", 0, 1)[0]
+                )
+                scales = (
+                    (directions.double().square().mean(0) + self.model.rms_epsilon)
+                    .rsqrt()
+                    .float()
+                )
+                directions = directions * (gain[:, None] * scales)
+                best = {
+                    side: (
+                        torch.empty((0, len(missing))),
+                        torch.empty((0, len(missing)), dtype=torch.int64),
+                    )
+                    for side in ("up", "down")
                 }
-            return self._lens_cache[key]
+                for start in range(0, self.model.vocab, 1024):
+                    weights = torch.from_numpy(
+                        self.model.weight_rows(
+                            "output.weight", start, min(1024, self.model.vocab - start)
+                        )
+                    )
+                    logits = weights @ directions
+                    for side, sign in (("up", 1), ("down", -1)):
+                        val, idx = (sign * logits).topk(min(32, len(logits)), dim=0)
+                        old_val, old_idx = best[side]
+                        vals, ids = (
+                            torch.cat((old_val, val)),
+                            torch.cat((old_idx, idx + start)),
+                        )
+                        val, order = vals.topk(min(32, len(vals)), dim=0)
+                        best[side] = (val, ids.gather(0, order))
+                for i, coord in enumerate(missing):
+                    row = {
+                        side: [
+                            self.tok.decode([t]) for t in best[side][1][:, i].tolist()
+                        ]
+                        for side in ("up", "down")
+                    }
+                    result[coord] = row
+                    self._save(f"gguf-lens-f32-v1:{coord[0]}:{coord[1]}", row)
+            if len(self._lens_cache) > 2048:
+                self._lens_cache.clear()
+            self._lens_cache.update(result)
+            return {
+                coord: {side: row[side][:k] for side in ("up", "down")}
+                for coord, row in result.items()
+            }
 
     def connections(self, layer, n, k=24, lens_k=5):
         self.validate_coordinate(layer, n)
+        if not 1 <= k <= 64 or not 0 <= lens_k <= 32:
+            raise ValueError("Request 1..64 connections and 0..32 lens tokens")
+        key = f"gguf-links-v1:{layer}:{n}"
+        with self.lock:
+            data = self._cached(key)
+            cached = data is not None
+            if data is None:
+                self.ensure_loaded()
+                started = time.monotonic()
+                gate, up = self.model.connection_vectors(layer, n)
+                data = rank_connections(gate, up, layer)
+                data.update(
+                    available=True,
+                    method="gated-MLP direct-path weight alignment",
+                    mode="on-demand",
+                    scope="all other layers of this quantized checkpoint",
+                    compute_seconds=time.monotonic() - started,
+                )
+                self._save(key, data)
+            out = {
+                **data,
+                "cached": cached,
+                **{side: [dict(c) for c in data[side][:k]] for side in ("up", "down")},
+            }
+            if lens_k:
+                neighbors = out["up"] + out["down"]
+                lenses = self.lens_many(
+                    [(c["layer"], c["n"]) for c in neighbors], lens_k
+                )
+                for c in neighbors:
+                    label = lenses[(c["layer"], c["n"])]
+                    c.update(lens=label["up"], lens_neg=label["down"])
+            return out
+
+    def cached_connections(self, layer, n, k=16):
+        self.validate_coordinate(layer, n)
+        data = self._cached(f"gguf-links-v1:{layer}:{n}")
+        if data is None:
+            return {"up": [], "down": [], "available": True, "pending": True}
+        return {**data, **{side: data[side][:k] for side in ("up", "down")}}
+
+    def connection_graph(self, layer, n, first=5, k=2, hops=1, zmin=15, cap=500):
+        self.validate_coordinate(layer, n)
+        return walk_connections(
+            lambda l, m: self.connections(l, m, 64, 0),
+            layer,
+            n,
+            first,
+            k,
+            hops,
+            zmin,
+            cap,
+        )
+
+    def connection_summary(self, layer, n, first=5, k=2, hops=1, top=24):
+        graph = self.connection_graph(layer, n, first, k, hops)
+        reach = reached_nodes(graph["links"], layer, n)
+        # Label the strongest 64 reached nodes; report the scope rather than
+        # inventing corpus-frequency/layerwise-lift statistics without an index.
+        selected = sorted(reach, key=lambda c: (abs(reach[c][0]), -reach[c][1], c))[:64]
+        lens = self.lens_many(selected, 8)
+        zmax = max((v[1] for v in reach.values()), default=1.0) or 1.0
+
+        def pool(nodes, flip):
+            counts, weights = Counter(), Counter()
+            for c in nodes:
+                hop, z, sign = reach[c]
+                tokens = {
+                    t.strip()
+                    for t in lens[c]["up" if sign * flip > 0 else "down"]
+                    if t.strip() and "\ufffd" not in t
+                }
+                for token in tokens:
+                    counts[token] += 1
+                    weights[token] += z / zmax * 0.8 ** (abs(hop) - 1)
+            return [
+                {"tok": t, "n": counts[t], "w": round(weights[t], 3)}
+                for t in sorted(weights, key=lambda t: (-weights[t], t))[:top]
+            ]
+
+        up, down = (
+            [c for c in selected if reach[c][0] < 0],
+            [c for c in selected if reach[c][0] > 0],
+        )
         return {
-            "up": [],
-            "down": [],
-            "available": False,
-            "reason": "GGUF connection heuristic has not been implemented",
+            "src": "on-demand logit",
+            "ranking": "weighted token counts among shown neighbors",
+            "links": len(graph["links"]),
+            "hops": hops,
+            "truncated": graph["truncated"],
+            "expanded_neurons": graph["expanded_neurons"],
+            "labelled_neurons": len(selected),
+            "reached_neurons": len(reach),
+            "up": {"neurons": len(up), "fed_by": pool(up, 1), "held_by": pool(up, -1)},
+            "down": {
+                "neurons": len(down),
+                "toward": pool(down, 1),
+                "away": pool(down, -1),
+            },
         }
 
     def vocab_strings(self):

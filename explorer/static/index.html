@@ -23,6 +23,7 @@
   <select id="layer" aria-label="layer"></select>
   <span class="seg" id="layout-mode" title="sheet layout"><button data-k="index">index</button><button data-k="writes" class="on">writes</button></span>
   <span class="seg" id="web-mode" title="connection web of the focused neuron: upstream and downstream cones; yellow links push the reader up, magenta push it down"><button data-w="off">no web</button><button data-w="on" class="on">web</button></span><input id="web-z" value="5" inputmode="numeric" aria-label="web top links" title="web: the open neuron's top links each way">
+  <select id="web-depth" aria-label="connection hops" title="Follow the selected neuron's connections"><option value="1">1 hop</option><option value="2">2 hops</option><option value="3">3 hops</option><option value="0">all hops</option></select>
   <input id="jump" placeholder="L22 N2742" aria-label="go to neuron" spellcheck="false">
   <span class="seg" id="q-mode"><button data-q="lens" class="on">lens</button><button data-q="fires">fires</button></span>
   <input id="lens-q" placeholder="search lens" aria-label="search" spellcheck="false" autocomplete="off">
@@ -42,7 +43,7 @@
   <pre id="model-command"></pre>
   <button id="model-copy">Copy launch command</button>
   <p class="dim">Dense decoder adapters cover common Llama, Qwen, Mistral, Gemma, GPT-2, GPT-NeoX, OPT and Phi layouts. Module shapes are checked on load. MoE, packed weights and closed model internals need other backends.</p>
-  <p class="dim">Qwen3.5 GGUF supports live activations, add/multiply steering and a per-neuron logit lens through llama.cpp. GGUF connection links, head ablation and other GGUF architectures need further adapters. Stop <code>qwen-lab</code> before loading the same model here.</p>
+  <p class="dim">Qwen3.5 GGUF supports live activations, steering, logit lens and connection links computed when you select a neuron. Choose the hop count to expand a neighborhood. Scores and labels are cached. Stop <code>qwen-lab</code> before loading the same model here.</p>
 </dialog>
 
 <main>

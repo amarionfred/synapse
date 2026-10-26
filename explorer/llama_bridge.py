@@ -64,12 +64,16 @@ class Bridge:
             ),
             "column": (C.c_int, [C.c_void_p, C.c_int, C.c_int, F32]),
             "lens": (C.c_int, [C.c_void_p, C.c_int, C.c_int, F32]),
+            "rows": (C.c_int, [C.c_void_p, C.c_char_p, C.c_int, C.c_int, C.c_int, F32]),
+            "connections": (C.c_int, [C.c_void_p, C.c_int, C.c_int, C.c_int, F32, F32]),
         }
         for name, (ret, args) in signatures.items():
             f = getattr(self.lib, "syn_" + name)
             f.restype, f.argtypes = ret, args
         self.arch = describe(path)
-        self.chat_template = metadata(path).get("tokenizer.chat_template")
+        meta = metadata(path)
+        self.chat_template = meta.get("tokenizer.chat_template")
+        self.rms_epsilon = meta.get("qwen35.attention.layer_norm_rms_epsilon", 1e-6)
         self.lease = open(ROOT / ".synapse/local-model-cpu.lock", "a")
         try:
             fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -184,6 +188,28 @@ class Bridge:
         out = np.empty(self.vocab, np.float32)
         self.check(self.lib.syn_lens(self.handle, l, n, ptr(out)))
         return out
+
+    def weight_rows(self, name, start, count, width=None):
+        width = self.arch["hidden"] if width is None else width
+        if not 1 <= count <= 2048 or not 1 <= width <= max(
+            self.arch["hidden"], self.arch["inter"]
+        ):
+            raise ValueError("Invalid weight-row allocation")
+        out = np.empty((count, width), np.float32)
+        self.check(
+            self.lib.syn_rows(self.handle, name.encode(), start, count, width, ptr(out))
+        )
+        return out
+
+    def connection_vectors(self, layer, n):
+        shape = (self.arch["n_layers"], self.arch["inter"])
+        gate, up = np.empty(shape, np.float32), np.empty(shape, np.float32)
+        self.check(
+            self.lib.syn_connections(
+                self.handle, layer, n, gate.size, ptr(gate), ptr(up)
+            )
+        )
+        return gate, up
 
 
 class Tokenizer:

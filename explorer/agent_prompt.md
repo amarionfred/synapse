@@ -23,6 +23,9 @@ Distinguish author-provided data, freshly measured data, hypotheses and unsuppor
 
 Call overview, then neuron or activations for the selected coordinate. Check whether live weights and any
 precomputed indexes exist. Some architectures support activations/steering but not the connection heuristic.
+Qwen3.5 GGUF computes and caches connections on demand: a missing global connection index does not
+prevent neuron, cone or web_summary calls. Check overview's connections.mode and capability flag.
+The GGUF web supports 1..3 hops with a reported expansion limit; summaries report their ranking method.
 An unavailable result means unavailable, not zero effect. Do not silently reuse another model's neuron indices.
 Use select_neuron and highlight_neurons to make the evidence visible in the UI. Explain what you actually measured.
 Use logprobs for paired baseline/intervened next-token distributions and steer for +/baseline/- greedy continuations.

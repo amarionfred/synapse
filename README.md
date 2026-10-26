@@ -50,13 +50,30 @@ synapse start --model /absolute/path/to/Qwen3.5-4B-Q4_K_M.gguf
 
 The bridge reads the GGUF's own tokenizer, quantized weights and live `ffn_swiglu`
 tensors. It supports per-token activations, add/multiply interventions, paired
-greedy generation and an on-demand logit lens. Weights stay quantized and unchanged
+greedy generation, an on-demand logit lens, and upstream/downstream connection
+links. Weights stay quantized and unchanged
 on disk. Qwen3.5 is the currently validated GGUF graph; other GGUF architectures
 are rejected explicitly. The model name remains visible above the map. Editing
 the launch-command preview does not switch the running server's checkpoint.
 
+Select a neuron to compute its strongest links across the other layers. The map
+draws the first five links each way by default; Details lists 24 with token labels.
+Click a neighbor to follow it, or choose **2 hops** / **3 hops** to expand the web.
+Scores and labels are cached per checkpoint, so returning to a neighborhood is fast.
+Each expansion request is bounded to 12 source neurons and reports any truncation.
+Hovering uses cached links and does not queue a new whole-network calculation.
+
+The connection score matches the original gated-MLP direct-path method:
+`g = gate_reader · (norm_gain_reader * down_writer)` and likewise `u` for the up
+projection; rank `abs(g*u)` by its z-score within each compared layer. GGUF norm
+gains already contain Qwen's conversion offset. The method uses the quantized
+file's weights, without substituting the author's BF16 index. On-demand web token
+summaries use weighted counts over the shown neighbors; layerwise token-frequency
+lift requires a whole-model index. These links describe weight alignment.
+
 This CPU backend uses a 2,048-token context and generates the three steering rows
-sequentially. Loading needs at least 4.5 GiB available RAM (more for larger files).
+sequentially. Loading needs at least 4.25 GiB available RAM after Python starts
+(more for larger files), based on the measured 3.7 GiB full-process connection/lens check.
 Synapse and `qwen-lab` share a process lock so they cannot load two Qwen contexts
 at once. Stop Synapse before returning to `qwen-lab chat`. Calibration, neuron
 names and caches belong to the quantized file; the author's BF16 data is separate.
@@ -107,8 +124,8 @@ proof that every variant, quantizer or operation works.
 | Separate gate/up MLP + supported pre-MLP RMSNorm | Direct-path weight heuristic; explicitly reported as a heuristic |
 | Compatible new dense variants | Structural detection, then runtime validation; not a blanket guarantee |
 | Transformers MoE, encoder-decoder, nonuniform MLP widths, packed/quantized projections | Need additional adapters/backends; rejected explicitly |
-| Qwen3.5 GGUF / pinned llama.cpp b11669 CPU | Live activations, add/multiply steering, three-way generation, per-neuron lens; validated on the installed 4B Q4_K_M file |
-| Other GGUF architectures; GGUF head ablation, connection heuristics and full lens indexing | Not yet implemented; capability reporting makes this explicit |
+| Qwen3.5 GGUF / pinned llama.cpp b11669 CPU | Live activations, steering, per-neuron lens, cached upstream/downstream connections and bounded multi-hop webs; validated on the installed 4B Q4_K_M file |
+| Other GGUF architectures; GGUF head ablation and whole-model lens indexing | Not yet implemented; capability reporting makes this explicit |
 | Closed API models | Can be research agents; weights and internal neurons are not available |
 
 The hook coordinate is the input to the MLP output projection, after gating or
@@ -152,6 +169,13 @@ reset and nonzero effects, and checks capture across multiple processing batches
 The native bridge uses headers pinned by commit and SHA256, not arbitrary system
 headers. See [the callback implementation](https://github.com/ggml-org/llama.cpp/blob/620d2225c/ggml/src/ggml-backend.cpp)
 and [Qwen's graph](https://github.com/ggml-org/llama.cpp/blob/620d2225c/src/models/qwen35.cpp).
+
+`scripts/verify_gguf_connections.py` checks the native connection dot products
+against independent NumPy matrix products, checks the same writer/reader pair
+from both directions, checks unchanged logits, and compares batched/scalar lens
+labels. Run it with the model services stopped. With Synapse running,
+`scripts/verify_connection_view.py` checks link lists, caching, binary map edges,
+two-hop expansion, summaries and the agent cone endpoint. Use the project Python.
 
 Park's Qwen3.5-4B Q4_K_M and OpenCode installation remains available through
 `qwen-lab chat`; its server has a separate 5 GiB available-RAM gate. The detailed
