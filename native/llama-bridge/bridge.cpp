@@ -2,6 +2,7 @@
 // ABI. The callback stops the scheduler after ffn_swiglu-L, before ffn_down
 // consumes it.
 #include "llama.h"
+#include "projection.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -20,6 +21,16 @@ struct Push {
   int layer, neuron, mode;
   float value;
 }; // mode 0 add, 1 multiply
+struct Research {
+  int layer = -1, token = -1, captured = 0;
+  const float *direction = nullptr;
+  float strength = 0.f;
+  float *vector = nullptr;
+  double *stats = nullptr; // [1 + 2*layers, 3], embedding then attention/MLP
+  const float *factors = nullptr;
+  std::vector<int> offsets, widths;
+  std::vector<std::string> names;
+};
 struct Engine {
   llama_model *model = nullptr;
   llama_context *ctx = nullptr;
@@ -34,6 +45,7 @@ struct Engine {
   bool full = false, observing = false;
   const Push *pushes = nullptr;
   int n_push = 0;
+  Research *research = nullptr; // stack-owned, cleared on every exit
   std::vector<int> visits, resid_visits;
   std::string failure;
   // Inspection streams read-only file pages. Drop this mapping's resident pages
@@ -114,6 +126,11 @@ struct Engine {
   }
 };
 
+static bool named_layer(const char *name, const char *format, int &layer) {
+  int consumed = 0;
+  return sscanf(name, format, &layer, &consumed) == 1 && name[consumed] == '\0';
+}
+
 static bool callback(ggml_tensor *t, bool ask, void *user) {
   auto &e = *static_cast<Engine *>(user);
   int layer = -1, consumed = 0;
@@ -121,15 +138,30 @@ static bool callback(ggml_tensor *t, bool ask, void *user) {
              t->name[consumed] == '\0';
   bool resid = !act && sscanf(t->name, "l_out-%d%n", &layer, &consumed) == 1 &&
                t->name[consumed] == '\0';
+  int writer = -1;
+  if (e.research && e.research->direction) {
+    if (strcmp(t->name, "model.input_embed") == 0) {
+      writer = 0;
+      layer = -1;
+    } else if (named_layer(t->name, "attn_output-%d%n", layer) ||
+               named_layer(t->name, "linear_attn_out-%d%n", layer)) {
+      writer = 1 + 2 * layer;
+    } else if (named_layer(t->name, "ffn_out-%d%n", layer)) {
+      writer = 2 + 2 * layer;
+    }
+  }
   bool push = false;
   for (int i = 0; act && i < e.n_push; ++i)
     push |= e.pushes[i].layer == layer;
   bool wanted = act && (e.full || e.read_layer == layer || push || e.observing);
   wanted |= resid && e.residuals;
+  wanted |= resid && e.research && e.research->layer == layer;
+  wanted |= writer >= 0;
   if (ask)
     return wanted;
   try {
-    if (!wanted || layer < 0 || layer >= e.layers)
+    if (!wanted || (writer != 0 && (layer < 0 || layer >= e.layers)) ||
+        writer >= 1 + 2 * e.layers)
       throw std::runtime_error("Unexpected callback tensor");
     int width = act ? e.inter : e.hidden;
     int tokens = t->ne[1];
@@ -164,9 +196,9 @@ static bool callback(ggml_tensor *t, bool ask, void *user) {
           }
         ggml_backend_tensor_set(t, buf.data(), 0, buf.size() * sizeof(float));
       }
-    } else {
+    } else if (resid) {
       e.resid_visits[layer] += tokens;
-      for (int j = 0; j < tokens; ++j) {
+      for (int j = 0; e.residuals && j < tokens; ++j) {
         double sum = 0;
         for (int n = 0; n < width; ++n) {
           double v = buf[size_t(j) * width + n];
@@ -174,6 +206,43 @@ static bool callback(ggml_tensor *t, bool ask, void *user) {
         }
         e.residuals[size_t(layer) * e.total + e.offset + j] = std::sqrt(sum);
       }
+      if (e.research && e.research->layer == layer &&
+          e.research->token >= e.offset && e.research->token < e.offset + tokens) {
+        const float *row = buf.data() + size_t(e.research->token - e.offset) * width;
+        for (int h = 0; h < width; ++h)
+          if (!std::isfinite(row[h]))
+            throw std::runtime_error("Non-finite captured residual");
+        memcpy(e.research->vector, row, width * sizeof(float));
+        e.research->captured++;
+      }
+    } else if (writer >= 0) {
+      std::vector<double> coefficients;
+      if (writer > 0 && e.research->factors) {
+        // The stored A=u^T W is applied to this matrix's actual input. This is
+        // a low-rank weight delta; direct projection instead uses u^T (W h).
+        // Quantized input/matmul rounding can make the two differ.
+        auto &r = *e.research;
+        auto *input = t->src[1];
+        const int input_width = r.widths[writer];
+        if (t->op != GGML_OP_MUL_MAT || !t->src[0] || !input ||
+            std::string(t->src[0]->name) != r.names[writer] ||
+            input->type != GGML_TYPE_F32 || !ggml_is_contiguous(input) ||
+            input->ne[0] != input_width || input->ne[1] != tokens ||
+            input->ne[2] != 1 || input->ne[3] != 1)
+          throw std::runtime_error("Unsupported low-rank writer input at " + std::string(t->name));
+        std::vector<float> values(size_t(input_width) * tokens);
+        ggml_backend_tensor_get(input, values.data(), 0, values.size() * sizeof(float));
+        const float *a = r.factors + r.offsets[writer];
+        coefficients.assign(tokens, 0.);
+        for (int j = 0; j < tokens; ++j)
+          for (int h = 0; h < input_width; ++h)
+            coefficients[j] += double(a[h]) * values[size_t(j) * input_width + h];
+      }
+      synapse::project_write(buf.data(), width, tokens, e.research->direction,
+                             e.research->strength, e.research->stats + 3 * writer,
+                             coefficients.empty() ? nullptr : coefficients.data());
+      if (e.research->strength != 0.f)
+        ggml_backend_tensor_set(t, buf.data(), 0, buf.size() * sizeof(float));
     }
   } catch (const std::exception &ex) {
     e.failure = ex.what();
@@ -335,7 +404,7 @@ int syn_eval(void *ptr, int *ids, int count, bool reset, bool observe,
       // All logits preserve all token rows even in the last layer during
       // inspection.
       std::vector<int8_t> outputs(n, 1);
-      if (acts || residuals || observe)
+      if (acts || residuals || observe || e.research)
         batch.logits = outputs.data();
       int rc = llama_decode(e.ctx, batch);
       if (!e.failure.empty())
@@ -354,6 +423,15 @@ int syn_eval(void *ptr, int *ids, int count, bool reset, bool observe,
         if (pushes[i].layer == l && !e.visits[l])
           throw std::runtime_error("Intervention hook did not execute");
     }
+    if (e.research) {
+      if (e.research->layer >= 0 && e.research->captured != 1)
+        throw std::runtime_error("Selected residual callback did not execute exactly once");
+      if (e.research->direction)
+        for (int slot = 0; slot < 1 + 2 * e.layers; ++slot)
+          if (e.research->stats[3 * slot] != count)
+            throw std::runtime_error("Missing or duplicate residual writer at slot " +
+                                     std::to_string(slot));
+    }
     memcpy(logits, llama_get_logits_ith(e.ctx, -1),
            size_t(e.vocab) * sizeof(float));
     e.pushes = nullptr;
@@ -370,9 +448,97 @@ int syn_eval(void *ptr, int *ids, int count, bool reset, bool observe,
     return -1;
   }
 }
+// Separate ABI leaves existing clients untouched. Every call is request scoped;
+// no model tensor, embedding/readout weight or persistent adapter is changed.
+static int research_eval(void *ptr, int *ids, int count, bool reset, int layer, int token,
+                 const float *direction, float strength, float *vector,
+                 double *stats, float *logits, const float *factors, int factor_count) {
+  auto &e = *static_cast<Engine *>(ptr);
+  Research research;
+  struct Clear { Engine &e; ~Clear() { e.research = nullptr; } } clear{e};
+  try {
+    if (!e.ctx)
+      throw std::runtime_error("Weight-only inspection has no inference context");
+    if (layer < -1 || layer >= e.layers || (layer >= 0 && !vector) ||
+        (layer >= 0 && (token < 0 || token >= count)) || !stats || !logits)
+      throw std::runtime_error("Invalid residual capture request");
+    synapse::validate_direction(direction, e.hidden, strength);
+    if (factors) {
+      if (!direction)
+        throw std::runtime_error("Weight factors require a direction");
+      research.offsets.assign(1 + 2 * e.layers, 0);
+      research.widths.assign(1 + 2 * e.layers, 0);
+      research.names.resize(1 + 2 * e.layers);
+      int offset = 0;
+      for (int l = 0; l < e.layers; ++l) {
+        const auto prefix = "blk." + std::to_string(l) + ".";
+        const auto attn = ggml_get_tensor(e.tensors, (prefix + "attn_output.weight").c_str())
+                          ? "attn_output.weight" : "ssm_out.weight";
+        for (int which = 0; which < 2; ++which) {
+          int slot = 1 + 2 * l + which;
+          auto name = prefix + (which == 0 ? attn : "ffn_down.weight");
+          auto *w = e.tensor(name);
+          if (w->ne[1] != e.hidden || w->ne[2] != 1 || w->ne[3] != 1 ||
+              w->ne[0] < 1 || w->ne[0] > 1000000 ||
+              offset + w->ne[0] > factor_count)
+            throw std::runtime_error("Weight factor shape does not match checkpoint");
+          research.names[slot] = name;
+          research.offsets[slot] = offset;
+          research.widths[slot] = int(w->ne[0]);
+          offset += int(w->ne[0]);
+        }
+      }
+      if (offset != factor_count)
+        throw std::runtime_error("Unexpected weight factor count");
+      for (int i = 0; i < factor_count; ++i)
+        if (!std::isfinite(factors[i]))
+          throw std::runtime_error("Non-finite weight factor");
+      research.factors = factors;
+    } else if (factor_count != 0) {
+      throw std::runtime_error("Missing weight factors");
+    }
+    std::fill(stats, stats + 3 * (1 + 2 * e.layers), 0.);
+    research.layer = layer;
+    research.token = token;
+    research.direction = direction;
+    research.strength = strength;
+    research.vector = vector;
+    research.stats = stats;
+    e.research = &research;
+    return syn_eval(ptr, ids, count, reset, false, false, -1, -1, nullptr, 0,
+                    nullptr, nullptr, logits);
+  } catch (const std::exception &ex) {
+    error = ex.what();
+    if (e.ctx)
+      llama_memory_clear(llama_get_memory(e.ctx), true);
+    return -1;
+  }
+}
+int syn_research(void *ptr, int *ids, int count, bool reset, int layer, int token,
+                 const float *direction, float strength, float *vector,
+                 double *stats, float *logits) {
+  return research_eval(ptr, ids, count, reset, layer, token, direction, strength,
+                        vector, stats, logits, nullptr, 0);
+}
+int syn_research_factors(void *ptr, int *ids, int count, bool reset, int layer, int token,
+                         const float *direction, float strength, float *vector,
+                         double *stats, float *logits, const float *factors, int factor_count) {
+  return research_eval(ptr, ids, count, reset, layer, token, direction, strength,
+                        vector, stats, logits, factors, factor_count);
+}
 int syn_column(void *ptr, int layer, int neuron, float *out) {
   try {
     static_cast<Engine *>(ptr)->column(layer, neuron, out);
+    return 0;
+  } catch (const std::exception &ex) {
+    error = ex.what();
+    return -1;
+  }
+}
+int syn_shape(void *ptr, const char *name, int64_t *shape) {
+  try {
+    auto *t = static_cast<Engine *>(ptr)->tensor(name);
+    std::copy(t->ne, t->ne + 4, shape);
     return 0;
   } catch (const std::exception &ex) {
     error = ex.what();

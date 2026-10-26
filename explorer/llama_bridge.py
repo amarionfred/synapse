@@ -5,11 +5,12 @@ import fcntl
 from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
-from gguf_metadata import describe, metadata
+from gguf_metadata import describe, metadata, identity
 
 ROOT = Path(__file__).resolve().parents[1]
 F32 = C.POINTER(C.c_float)
 I32 = C.POINTER(C.c_int)
+D64 = C.POINTER(C.c_double)
 
 
 class Push(C.Structure):
@@ -72,6 +73,20 @@ class Bridge:
         for name, (ret, args) in signatures.items():
             f = getattr(self.lib, "syn_" + name)
             f.restype, f.argtypes = ret, args
+        if hasattr(self.lib, "syn_research"):
+            self.lib.syn_research.restype = C.c_int
+            self.lib.syn_research.argtypes = [
+                C.c_void_p, I32, C.c_int, C.c_bool, C.c_int, C.c_int,
+                F32, C.c_float, F32, D64, F32,
+            ]
+        if hasattr(self.lib, "syn_research_factors"):
+            self.lib.syn_research_factors.restype = C.c_int
+            self.lib.syn_research_factors.argtypes = self.lib.syn_research.argtypes + [F32, C.c_int]
+        if hasattr(self.lib, "syn_shape"):
+            self.lib.syn_shape.restype = C.c_int
+            self.lib.syn_shape.argtypes = [C.c_void_p, C.c_char_p, C.POINTER(C.c_int64)]
+        self.model_path = Path(path).expanduser().resolve()
+        self.identity, self.model_key = identity(self.model_path)
         self.arch = describe(path)
         meta = metadata(path)
         self.chat_template = meta.get("tokenizer.chat_template")
@@ -188,6 +203,48 @@ class Bridge:
         self.check(self.lib.syn_column(self.handle, l, n, ptr(out)))
         return out
 
+    def research(self, ids, *, reset=True, layer=None, position=-1,
+                 direction=None, strength=0.0, factors=None):
+        """Selected residual capture and reversible projection of residual writes.
+
+        No neuron pushes are combined with this operation. The shared readout is
+        untouched. The native ABI verifies every intended writer on every token.
+        """
+        from residual_projection import unit_direction, bounded_strength
+        if not hasattr(self.lib, "syn_research"):
+            raise RuntimeError("Residual research needs a rebuilt bridge and server restart")
+        ids = np.ascontiguousarray(ids, dtype=np.int32)
+        if ids.ndim != 1 or not 1 <= len(ids) <= 2048:
+            raise ValueError("Residual research needs 1..2048 tokens")
+        hidden, layers = self.arch["hidden"], self.arch["n_layers"]
+        if layer is not None and (type(layer) is not int or not 0 <= layer < layers):
+            raise ValueError("Invalid residual capture layer")
+        if type(position) is not int or not -len(ids) <= position < len(ids):
+            raise ValueError("Invalid residual token position")
+        position %= len(ids)
+        strength = bounded_strength(strength)
+        u = unit_direction(direction, hidden) if direction is not None else None
+        if u is None and strength != 0:
+            raise ValueError("Nonzero projection requires a direction")
+        vector = np.empty(hidden, np.float32) if layer is not None else None
+        stats = np.zeros((1 + 2 * layers, 3), np.float64)
+        logits = np.empty(self.vocab, np.float32)
+        args = (
+            self.handle, ptr(ids, I32), len(ids), reset,
+            -1 if layer is None else layer, position, ptr(u), strength,
+            ptr(vector), ptr(stats, D64), ptr(logits),
+        )
+        if factors is None:
+            self.check(self.lib.syn_research(*args))
+        else:
+            if not hasattr(self.lib, "syn_research_factors"):
+                raise RuntimeError("Weight factors require a rebuilt bridge and restart")
+            factors = np.ascontiguousarray(factors, dtype=np.float32)
+            if factors.ndim != 1 or factors.size > 2_000_000 or not np.isfinite(factors).all():
+                raise ValueError("Invalid bounded weight factors")
+            self.check(self.lib.syn_research_factors(*args, ptr(factors), factors.size))
+        return logits, vector, stats
+
     def lens(self, l, n):
         out = np.empty(self.vocab, np.float32)
         self.check(self.lib.syn_lens(self.handle, l, n, ptr(out)))
@@ -204,6 +261,13 @@ class Bridge:
             self.lib.syn_rows(self.handle, name.encode(), start, count, width, ptr(out))
         )
         return out
+
+    def weight_shape(self, name):
+        if not hasattr(self.lib, "syn_shape"):
+            raise RuntimeError("Tensor shapes need a rebuilt bridge and server restart")
+        shape = (C.c_int64 * 4)()
+        self.check(self.lib.syn_shape(self.handle, name.encode(), shape))
+        return tuple(shape)
 
     def connection_vectors(self, layer, n):
         shape = (self.arch["n_layers"], self.arch["inter"])

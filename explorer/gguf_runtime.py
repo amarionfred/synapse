@@ -8,7 +8,7 @@ from collections import Counter
 import numpy as np
 import torch
 from runtime import Runtime, REFERENCE_TEXT
-from model_config import MODEL, ARCH, NO_MODEL
+from model_config import MODEL, ARCH, NO_MODEL, MODEL_KEY, IDENTITY
 from llama_bridge import Bridge, Tokenizer
 from connection_graph import rank_connections, walk_connections, reached_nodes
 
@@ -17,6 +17,7 @@ class GGUFRuntime(Runtime):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.inspector = None
+        self.research_validated = False
 
     def inspection_bridge(self):
         """Called under self.lock. Never loads inference or takes its CPU slot."""
@@ -98,6 +99,7 @@ class GGUFRuntime(Runtime):
                 "multiplicative_steering": True,
                 "logit_lens": True,
                 "weight_connections": True,
+                "residual_projection": self.research_validated,
                 "attention_heads": [0] * ARCH["n_layers"],
             },
             "dose_units": "median reference residual norm / dequantized output-projection column norm; quantized matmul adds numerical error",
@@ -109,6 +111,15 @@ class GGUFRuntime(Runtime):
                 "max_expansions_per_request": 12,
             },
             "generation": "three independent greedy rows, sequential on CPU",
+            "residual_research": {
+                "implementation_available": bool(
+                    self.model is not None and hasattr(self.model.lib, "syn_research")
+                ),
+                "callback_validation_passed": self.research_validated,
+                "scope": "request-scoped input embedding and block output projection",
+                "saved_weights_modified": False,
+                "behavior_validated": False,
+            },
             "note": "Links and labels use this GGUF's read-only weights without inference loading; hover is cache-only. Activations and steering still require admitted inference. Head ablation and whole-model lens indexing are not implemented. Quantized calibration is separate from the author's data.",
         }
 
@@ -231,6 +242,121 @@ class GGUFRuntime(Runtime):
                 else None
             )
             return base, changed
+
+    def residual_probe(self, body):
+        """Paired research request; never a persistent chat setting or weight edit."""
+        from residual_projection import projection_request
+        text, layer, max_new, direction, strength = projection_request(
+            body, MODEL_KEY, ARCH["hidden"], ARCH["n_layers"]
+        )
+        with self.lock:
+            factors, artifact = None, None
+            if "artifact" in (body.get("projection") or {}):
+                from residual_projection import artifact_path, load_factors
+                path = artifact_path(body["projection"]["artifact"])
+                if not path.is_file():
+                    raise ValueError("Factor archive does not exist")
+                created_inspector = self.model is None and self.inspector is None
+                try:
+                    direction, factors, artifact = load_factors(self.inspection_bridge(), str(path))
+                finally:
+                    # Do not let a new temporary validator change inference's
+                    # available-RAM admission estimate or persist on failure.
+                    if created_inspector and self.inspector is not None:
+                        self.inspector.close()
+                        self.inspector = None
+            self.ensure_loaded()
+            ids = self._ids(text, True)
+            if len(ids) > 512 or len(ids) + max_new > 2048:
+                raise ValueError("Residual probes allow at most 512 input tokens")
+            if not self.research_validated:
+                reference = self.model.research(ids)[0]
+                zero_direction = np.zeros(ARCH["hidden"], np.float32)
+                zero_direction[0] = 1.
+                observed = self.model.research(ids, direction=zero_direction, strength=0.)[0]
+                if (not np.isfinite(reference).all() or not np.isfinite(observed).all()
+                        or float(np.max(np.abs(reference - observed))) > 1e-5):
+                    raise RuntimeError("Zero-strength writer projection does not recover baseline")
+                self.research_validated = True
+
+            def row(u, scale, bank=None):
+                logits, vector, prefill = self.model.research(
+                    ids, layer=layer, direction=u, strength=scale, factors=bank
+                )
+                first = logits.copy()
+                audit = prefill.copy()
+                tokens = []
+                finish = "length"
+                for step in range(max_new):
+                    if not np.isfinite(logits).all():
+                        raise RuntimeError("Non-finite generation logits")
+                    token = int(logits.argmax())
+                    if self.model.lib.syn_eog(self.model.handle, token):
+                        finish = "eog"
+                        break
+                    tokens.append(token)
+                    if step + 1 < max_new:
+                        logits, _, visits = self.model.research(
+                            [token], reset=False, direction=u, strength=scale, factors=bank
+                        )
+                        audit += visits
+                if not np.isfinite(first).all():
+                    raise RuntimeError("Non-finite next-token logits")
+                lp = torch.log_softmax(torch.from_numpy(first), -1).numpy()
+                top = np.argsort(lp)[-10:][::-1]
+                result = {
+                    "text": self.tok.decode(tokens, skip_special_tokens=True),
+                    "token_ids": tokens, "finish": finish, "residual": vector.tolist(),
+                    "top": [{"id": int(i), "text": self.tok.decode([int(i)]),
+                             "logprob": float(lp[i])} for i in top],
+                    "prefill_writer_stats": prefill.tolist(),
+                    "all_writer_stats": audit.tolist(),
+                    "writer_stats_observed": u is not None,
+                }
+                return result, first, lp
+
+            base, original, blp = row(None, 0.)
+            result = {
+                "model_key": MODEL_KEY, "identity": IDENTITY, "prompt": text,
+                "input_token_ids": ids, "input_tokens": len(ids),
+                "capture_layer": layer, "capture_position": len(ids) - 1,
+                "capture_token": self.tok.decode([ids[-1]]),
+                "capture_point": "l_out after final rendered input token",
+                "writer_order": "input embedding, then attention and MLP for each layer",
+                "stats_columns": ["token_visits", "correction_norm_squared", "write_norm_squared"],
+                "baseline": base, "saved_weights_modified": False,
+            }
+            if direction is not None:
+                changed, _, alp = row(direction, strength, factors)
+                restored = self.model.research(ids)[0]
+                delta = float(np.max(np.abs(restored - original)))
+                if not np.isfinite(restored).all() or delta > 1e-5:
+                    raise RuntimeError(f"Baseline restoration failed: max logit difference {delta}")
+                result.update(
+                    intervened=changed, strength=strength,
+                    kl_baseline_to_intervened=float(np.sum(np.exp(blp) * (blp - alp))),
+                    baseline_restoration_max_abs=delta,
+                    method="low_rank_weight_delta" if factors is not None else "write_projection",
+                    artifact=artifact,
+                )
+            return result
+
+    def export_residual_factors(self, body):
+        from residual_projection import artifact_path, export_factors, unit_direction
+        if body.get("model_key") != MODEL_KEY:
+            raise ValueError("Factor export checkpoint key differs")
+        u = unit_direction(body.get("direction"), ARCH["hidden"])
+        destination = artifact_path(body.get("destination"))
+        source = body.get("direction_source")
+        if not isinstance(source, str) or not source.strip() or len(source) > 4000:
+            raise ValueError("Provide the recorded direction source")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock:
+            bridge = self.inspection_bridge()
+            manifest = export_factors(bridge, u, destination, {
+                "model_key": MODEL_KEY, "direction_source": source,
+            })
+        return {"path": str(destination), "manifest": manifest, "applied": False}
 
     def steer_multi(self, pushes, rows_messages, max_new=200, cancel=None):
         if len(rows_messages) != 3 or not 1 <= max_new <= 1024:

@@ -793,6 +793,46 @@ async def agent_activations(req: Request):
             "heads": [{"layer": l, "head": "all" if hd is None else hd, "scale": sc} for l, hd, sc in hs]}
 
 
+@app.post("/api/agent/residual")
+async def agent_residual(req: Request):
+    """Bounded paired GGUF residual capture/projection, with explicit checkpoint key."""
+    raw = bytearray()
+    async for chunk in req.stream():
+        if len(raw) + len(chunk) > 256 * 1024:
+            raise ValueError("Residual request exceeds 256 KiB")
+        raw.extend(chunk)
+    if not GGUF or not hasattr(rt, "residual_probe"):
+        raise ValueError("Residual projection is available only for the native GGUF backend")
+    if off := _live_off():
+        return off
+    try:
+        body = json.loads(raw)
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("Residual request must contain valid JSON") from exc
+    if not isinstance(body, dict):
+        raise ValueError("Residual request must be an object")
+    return await inspection_call(req, rt.residual_probe, body)
+
+
+@app.post("/api/agent/residual/factors")
+async def agent_residual_factors(req: Request):
+    """Export a new, checkpoint-bound factor archive; does not enable it."""
+    raw = bytearray()
+    async for chunk in req.stream():
+        if len(raw) + len(chunk) > 256 * 1024:
+            raise ValueError("Factor request exceeds 256 KiB")
+        raw.extend(chunk)
+    if not GGUF or not hasattr(rt, "export_residual_factors"):
+        raise ValueError("Factor export requires the native GGUF backend")
+    try:
+        body = json.loads(raw)
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("Factor request must contain valid JSON") from exc
+    if not isinstance(body, dict):
+        raise ValueError("Factor request must be an object")
+    return await inspection_call(req, rt.export_residual_factors, body)
+
+
 def _interventions(b):
     """pushes and heads from a request body, as activations takes them; (pushes, heads, error)."""
     items, heads = b.get("neurons") or [], list(b.get("heads") or [])

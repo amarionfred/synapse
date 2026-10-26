@@ -56,6 +56,12 @@ on disk. Qwen3.5 is the currently validated GGUF graph; other GGUF architectures
 are rejected explicitly. The model name remains visible above the map. Editing
 the launch-command preview does not switch the running server's checkpoint.
 
+For bounded residual-vector capture and reversible rank-one weight corrections,
+see [the residual projection research path](docs/RESIDUAL_PROJECTION.md).
+It uses separate, checkpoint-bound factor archives and leaves the GGUF unchanged.
+A rebuild and service restart are required; infrastructure validation and a
+useful refusal direction are separate research results.
+
 Select a neuron to compute its strongest links across the other layers. The map
 draws the first five links each way by default; Details lists 24 with token labels.
 Click a neighbor to follow it, or choose **2 hops** / **3 hops** to expand the web.
