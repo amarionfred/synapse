@@ -27,17 +27,39 @@ Model downloads require disk space; CPU admission estimates check available RAM.
 On Park's installed machine, the `synapse` command is on PATH:
 
 ```bash
-synapse start              # bounded systemd user service; 3 GiB RAM, no swap
+synapse start              # bounded user service; 3 GiB (Transformers) / 5 GiB (GGUF), no swap
 synapse status             # checkpoint, actual loaded state and capabilities
 synapse codex              # interactive Codex with the same explorer MCP tools
 synapse stop
 ```
 
-`start` uses a conservative 3 GiB process limit for this laptop. For a larger
+`start` uses a conservative 3 GiB process limit for Transformers and 5 GiB for GGUF. For a larger
 checkpoint on suitable hardware, use `serve` with an appropriate resource limit.
-Select another model using `--model <Hugging-Face-ID-or-local-folder>` and optionally
+Select another model using `--model <Hugging-Face-ID-or-local-folder-or-GGUF-file>` and optionally
 `--revision <commit>`. Stop the existing process first. Selection is remembered
 locally; the **synapse** dialog generates the launch command.
+
+For the installed **Qwen3.5-4B Q4_K_M** file, use the native inspection bridge:
+
+```bash
+python scripts/build_gguf_bridge.py  # C++ compiler + the installed llama.cpp b11669 runtime
+qwen-lab stop
+synapse stop
+synapse start --model /absolute/path/to/Qwen3.5-4B-Q4_K_M.gguf
+```
+
+The bridge reads the GGUF's own tokenizer, quantized weights and live `ffn_swiglu`
+tensors. It supports per-token activations, add/multiply interventions, paired
+greedy generation and an on-demand logit lens. Weights stay quantized and unchanged
+on disk. Qwen3.5 is the currently validated GGUF graph; other GGUF architectures
+are rejected explicitly. The model name remains visible above the map. Editing
+the launch-command preview does not switch the running server's checkpoint.
+
+This CPU backend uses a 2,048-token context and generates the three steering rows
+sequentially. Loading needs at least 4.5 GiB available RAM (more for larger files).
+Synapse and `qwen-lab` share a process lock so they cannot load two Qwen contexts
+at once. Stop Synapse before returning to `qwen-lab chat`. Calibration, neuron
+names and caches belong to the quantized file; the author's BF16 data is separate.
 
 For Lyra's shipped Qwen visualization without weights:
 
@@ -84,8 +106,9 @@ proof that every variant, quantizer or operation works.
 | Final norm + unembedding | Logit lens when the adapter exposes both |
 | Separate gate/up MLP + supported pre-MLP RMSNorm | Direct-path weight heuristic; explicitly reported as a heuristic |
 | Compatible new dense variants | Structural detection, then runtime validation; not a blanket guarantee |
-| MoE, encoder-decoder, nonuniform MLP widths, packed/quantized projections | Need additional adapters/backends; rejected explicitly |
-| GGUF / llama.cpp | Separate local chat baseline; no neuron hooks in this backend yet |
+| Transformers MoE, encoder-decoder, nonuniform MLP widths, packed/quantized projections | Need additional adapters/backends; rejected explicitly |
+| Qwen3.5 GGUF / pinned llama.cpp b11669 CPU | Live activations, add/multiply steering, three-way generation, per-neuron lens; validated on the installed 4B Q4_K_M file |
+| Other GGUF architectures; GGUF head ablation, connection heuristics and full lens indexing | Not yet implemented; capability reporting makes this explicit |
 | Closed API models | Can be research agents; weights and internal neurons are not available |
 
 The hook coordinate is the input to the MLP output projection, after gating or
@@ -121,6 +144,14 @@ They check unchanged baseline outputs, the additive column equation, whole-MLP
 ablation, zero-dose continuation equivalence, cleanup and checkpoint isolation.
 They establish implementation behavior, not capability improvement in trained models.
 Machine-specific receipts and smoke outputs live locally under `evidence/`.
+
+`scripts/verify_gguf_native.py` is an explicit real-checkpoint test for the installed
+Qwen file. Run it with Synapse and `qwen-lab` stopped, under a memory limit. It
+compares plain llama.cpp against observation and zero-dose callbacks, checks state
+reset and nonzero effects, and checks capture across multiple processing batches.
+The native bridge uses headers pinned by commit and SHA256, not arbitrary system
+headers. See [the callback implementation](https://github.com/ggml-org/llama.cpp/blob/620d2225c/ggml/src/ggml-backend.cpp)
+and [Qwen's graph](https://github.com/ggml-org/llama.cpp/blob/620d2225c/src/models/qwen35.cpp).
 
 Park's Qwen3.5-4B Q4_K_M and OpenCode installation remains available through
 `qwen-lab chat`; its server has a separate 5 GiB available-RAM gate. The detailed

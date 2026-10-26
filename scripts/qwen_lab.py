@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local Qwen lifecycle, guarded by measured available RAM and a cgroup limit."""
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -42,6 +43,13 @@ def start():
         return
     if not MODEL.is_file():
         raise SystemExit("The model download is not complete.")
+    lease=ROOT/".synapse/local-model-cpu.lock"
+    lease.parent.mkdir(exist_ok=True)
+    with open(lease,"a") as f:
+        try:
+            fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("Synapse or another Qwen probe has the model loaded. Run synapse stop before qwen-lab chat.") from None
     ram = available()
     if ram < MIN_AVAILABLE:
         raise SystemExit(f"Model remains stopped: {ram/1024**3:.2f} GiB RAM available; need at least 5.00 GiB. Close unused apps, then retry.")
@@ -57,7 +65,7 @@ def start():
         "--property=MemoryMax=4G", "--property=MemorySwapMax=0",
         "--property=CPUQuota=300%", "--property=Nice=10", "--property=TasksMax=96",
         "--working-directory="+str(ROOT),
-        exe, "--model", str(MODEL), "--alias", "qwen3.5-4b-q4km",
+        "flock", "--nonblock", "--no-fork", str(lease), exe, "--model", str(MODEL), "--alias", "qwen3.5-4b-q4km",
         "--host", "127.0.0.1", "--port", "8087", "--n-gpu-layers", "0",
         "--ctx-size", "16384", "--parallel", "1", "--threads", "4", "--threads-batch", "4",
         "--threads-http", "2", "--batch-size", "128", "--ubatch-size", "64",

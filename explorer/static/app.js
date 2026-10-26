@@ -20,10 +20,19 @@ const index = await api("/api/index");
 const arch = index.arch;
 $("#inf-hi").value = arch.n_layers - 1;
 $("#model-current").textContent = `${index.model} · ${arch.n_layers} layers · ${arch.inter} neurons per layer`;
-$("#model-mode").textContent = index.bundled ? "Lyra's cached Qwen exhibit. No live weights are loaded." : "Live checkpoint: loads on request. Neuron positions belong to this checkpoint only.";
+const modelName = index.model.split("/").at(-1);
+$("#active-checkpoint").textContent = modelName;
+$("#active-checkpoint").title = index.model;
+$("#model-load").textContent = `Load ${modelName}`;
+$("#model-mode").textContent = index.bundled ? "Lyra's cached Qwen exhibit. No live weights are loaded." : `Active map: ${modelName}. Backend: ${index.backend}. Weights load on request.`;
 $("#model-choice").value = index.model;
 const quoteShell = s => "'" + s.replaceAll("'", "'\"'\"'") + "'";
-function modelCommand() { $("#model-command").textContent = "synapse stop\nsynapse start --model " + quoteShell($("#model-choice").value); }
+function modelCommand() {
+  const choice = $("#model-choice").value.trim();
+  $("#model-command").textContent = "synapse stop\nsynapse start --model " + quoteShell(choice);
+  $("#model-load").disabled = index.cache_only || choice !== index.model;
+  $("#model-change-note").textContent = choice !== index.model ? `This is a launch-command preview. The active map is still ${modelName}; restart with the command below to switch.` : "Run this command in a terminal to select the checkpoint. Each checkpoint has separate data.";
+}
 modelCommand();
 $("#model-choice").oninput = modelCommand;
 $("#model-copy").onclick = async () => { await navigator.clipboard.writeText($("#model-command").textContent); $("#model-copy").textContent = "Copied"; };
@@ -35,7 +44,7 @@ $("#model-open").onclick = async () => {
 $("#model-load").disabled = index.cache_only;
 $("#model-load").onclick = async () => {
   $("#model-load").disabled = true; $("#model-load").textContent = "Loading…";
-  try { const r = await api("/api/model/load", {}); $("#model-capabilities").textContent = JSON.stringify(r.runtime, null, 2); $("#model-load").textContent = "Model ready"; }
+  try { const r = await api("/api/model/load", {}); $("#model-capabilities").textContent = JSON.stringify(r.runtime, null, 2); $("#model-load").textContent = `${modelName} ready`; }
   catch(e) { $("#model-capabilities").textContent = e.message; $("#model-load").textContent = "Retry loading"; $("#model-load").disabled = false; }
 };
 const tip = $("#tip");
@@ -115,7 +124,13 @@ document.querySelectorAll("#layout-mode button").forEach(b => b.onclick = () => 
 setLayout("writes");
 
 // connection web of the focused neuron: downstream cone forward, upstream cone backward
-let webOn = true, webKey = null;
+const connectionsAvailable = index.runtime?.capabilities?.weight_connections !== false;
+let webOn = connectionsAvailable, webKey = null;
+if (!connectionsAvailable) {
+  const on = document.querySelector('#web-mode button[data-w="on"]');
+  on.disabled = true;
+  on.title = "Connection links are not implemented for this backend.";
+}
 async function refreshWeb() {
   document.querySelectorAll("#web-mode button").forEach(b => b.classList.toggle("on", (b.dataset.w === "on") === webOn));
   const f = state.focus, first = Math.max(1, Math.min(24, Math.round(Number($("#web-z").value) || 5)));
@@ -352,6 +367,7 @@ $("#show-random").onchange = renderList;
 function webSummaryHTML() {
   const w = state.webSum, f = state.focus;
   if (!w || !f || f.kind !== "neuron" || w.layer !== f.layer || w.n !== f.n) return "";
+  if (w.src === "unavailable") return `<p class="dim">${esc(w.reason || "Connection indexes are unavailable for this checkpoint.")}</p>`;
   const chips = list => list.length ? list.map(t => `<span class="chip" data-q="${esc(t.tok)}" title="${t.n} neurons · score ${t.w}">${esc(t.tok)}<i>${t.n}</i></span>`).join("")
     : `<span class="faint">nothing above chance</span>`;
   return `<div class="head">web of L${w.layer} N${w.n} · ${w.links} links · ${w.src} lens, ranked by lift over each layer</div>
@@ -582,6 +598,7 @@ async function loadLive(layer, n) {
 // own. Reversing the writer reverses g and u together, so the sign holds for either direction of the writer.
 function renderConnections() {
   const el = $("#d-con") || $("#d-con-wrap"); if (!el || !state.con) return;
+  if (state.con.available === false) { el.textContent = state.con.reason || "Connection links are unavailable for this backend."; return; }
   const tok = t => `<span class="tok">${esc(t)}</span>`;
   const row = c => {
     const pole = c.sign > 0 ? 1 : -1, toks = (pole > 0 ? c.lens : c.lens_neg) || [];
@@ -737,6 +754,10 @@ async function runReads(f, text) {
 async function pollStatus() {
   try {
     const s = await api("/api/status");
+    if (s.model_key && s.model_key !== index.model_key) {
+      location.reload();
+      return;
+    }
     state.statusText = s.status;
     $("#status").textContent = s.status === "ready" ? "" : s.status;
     if (s.status === "ready" && lensResults && !lensResults.ready) runLensSearch();

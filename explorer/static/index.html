@@ -26,6 +26,7 @@
   <input id="jump" placeholder="L22 N2742" aria-label="go to neuron" spellcheck="false">
   <span class="seg" id="q-mode"><button data-q="lens" class="on">lens</button><button data-q="fires">fires</button></span>
   <input id="lens-q" placeholder="search lens" aria-label="search" spellcheck="false" autocomplete="off">
+  <span id="active-checkpoint" class="mono"></span>
   <span id="status" class="mono"></span>
 </header>
 <dialog id="model-dialog">
@@ -36,12 +37,12 @@
   <button id="model-load">Load model for live experiments</button>
   <pre id="model-capabilities"></pre>
   <h3>Use another checkpoint</h3>
-  <label>Hugging Face model ID or local checkpoint folder<input id="model-choice" autocomplete="off" spellcheck="false"></label>
-  <p class="dim">Stop the current server, then run this command in a terminal. Each checkpoint has separate data.</p>
+  <label>Hugging Face model ID, checkpoint folder or Qwen3.5 GGUF file<input id="model-choice" autocomplete="off" spellcheck="false"></label>
+  <p class="dim" id="model-change-note"></p>
   <pre id="model-command"></pre>
   <button id="model-copy">Copy launch command</button>
   <p class="dim">Dense decoder adapters cover common Llama, Qwen, Mistral, Gemma, GPT-2, GPT-NeoX, OPT and Phi layouts. Module shapes are checked on load. MoE, packed weights and closed model internals need other backends.</p>
-  <p class="dim">The installed Qwen GGUF runs separately through <code>qwen-lab chat</code>. Its internal neurons are not exposed by this Transformers backend.</p>
+  <p class="dim">Qwen3.5 GGUF supports live activations, add/multiply steering and a per-neuron logit lens through llama.cpp. GGUF connection links, head ablation and other GGUF architectures need further adapters. Stop <code>qwen-lab</code> before loading the same model here.</p>
 </dialog>
 
 <main>

@@ -27,3 +27,12 @@ def test_reject_invalid_coordinates_paths_and_provider():
         assert c.get("/api/layout?kind=../../config").status_code == 422
         assert c.post("/api/agent/chat", json={"provider":"unknown","message":"hello"}).status_code == 422
         assert c.post("/api/agent/chat", json={"chat":"../../private","message":"hello"}).status_code == 422
+
+
+def test_unavailable_connections_remain_explicit(monkeypatch):
+    from server import rt
+    monkeypatch.setattr(rt, "connections", lambda *args: {"up": [], "down": [], "available": False, "reason": "Unsupported backend operation"})
+    with TestClient(app, base_url="http://127.0.0.1:8791") as c:
+        out = c.get("/api/connections?layer=0&n=0").json()
+        assert out["available"] is False
+        assert out["reason"] == "Unsupported backend operation"

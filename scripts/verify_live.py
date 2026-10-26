@@ -26,6 +26,16 @@ def record():
 
 
 try:
+    # systemd starts before Python has finished importing the server.
+    deadline=time.monotonic()+30
+    while True:
+        try:
+            request("/api/status")
+            break
+        except OSError:
+            if time.monotonic()>=deadline:
+                raise
+            time.sleep(0.5)
     results["overview"] = info = request("/api/model/load", {})
     l, n = min(10, info["arch"]["n_layers"]-1), min(3, info["arch"]["inter"]-1)
     for name, path, body in [

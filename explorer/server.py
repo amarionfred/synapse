@@ -21,7 +21,9 @@ sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rank import compute_units  # noqa: E402
 from runtime import NO_MODEL, Runtime  # noqa: E402
-from model_config import MODEL, ARCH, CACHE, STATE, MODEL_KEY, IDENTITY, BUNDLED
+from model_config import MODEL, ARCH, CACHE, STATE, MODEL_KEY, IDENTITY, BUNDLED, GGUF
+if GGUF:
+    from gguf_runtime import GGUFRuntime as Runtime
 import codex_agent
 
 RUNS, STATS = str(STATE / "runs"), str(STATE / "stats")
@@ -148,7 +150,7 @@ def names():
 def index():
     runs = layer_runs()
     return {"model": MODEL, "arch": ARCH, "identity": IDENTITY, "model_key": MODEL_KEY,
-            "cache_only": NO_MODEL, "bundled": BUNDLED, "runtime": rt.capabilities(),
+            "cache_only": NO_MODEL, "bundled": BUNDLED, "backend": "gguf" if GGUF else "transformers", "runtime": rt.capabilities(),
             "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())}, "status": rt.status}
 
 
@@ -219,7 +221,7 @@ async def connections(layer: int, n: int, k: int = 24, lens: int = 5):
     out = await asyncio.to_thread(rt.connections, layer, n, k, lens)
     words = await asyncio.to_thread(lambda: {l: ranked_words(l) for l in {c["layer"] for c in out["down"] + out["up"]}})
     nm = names()
-    out = {side: [dict(c) for c in out[side]] for side in ("down", "up")}
+    out = {**out, **{side: [dict(c) for c in out[side]] for side in ("down", "up")}}
     for c in out["down"] + out["up"]:
         c["name"] = nm.get(f"L{c['layer']}/N{c['n']}", "")
         c["words"] = words[c["layer"]].get(c["n"], [])
@@ -647,6 +649,9 @@ async def agent_neuron(layer: int, n: int):
                       "steer_down": c.get("lens_neg"), "words": c.get("words") or None, "name": c.get("name") or None}
     out["writes_into"] = [slim(c) for c in con["down"]]
     out["reads_from"] = [slim(c) for c in con["up"]]
+    out["connections_available"] = con.get("available", True)
+    if con.get("reason"):
+        out["connections_note"] = con["reason"]
     return out
 
 

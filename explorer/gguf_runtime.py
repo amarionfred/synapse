@@ -1,0 +1,276 @@
+"""Native Qwen3.5 GGUF inspection. Operations share one serialized CPU context."""
+
+import json
+from pathlib import Path
+import subprocess
+import numpy as np
+import torch
+from runtime import Runtime, REFERENCE_TEXT
+from model_config import MODEL, ARCH, NO_MODEL
+from llama_bridge import Bridge, Tokenizer
+
+
+class GGUFRuntime(Runtime):
+    def ensure_loaded(self):
+        with self.lock:
+            if self.model is not None:
+                return
+            if NO_MODEL:
+                raise RuntimeError("Live model disabled")
+            if (
+                subprocess.run(
+                    [
+                        "systemctl",
+                        "--user",
+                        "is-active",
+                        "--quiet",
+                        "qwen-openweights-lab.service",
+                    ],
+                    capture_output=True,
+                ).returncode
+                == 0
+            ):
+                raise RuntimeError(
+                    "Stop the separate Qwen chat runtime first: qwen-lab stop. Both use the same memory budget."
+                )
+            mem = dict(
+                line.split(":", 1)
+                for line in Path("/proc/meminfo").read_text().splitlines()
+            )
+            available = int(mem["MemAvailable"].split()[0]) * 1024
+            required = max(
+                int(4.5 * 2**30), Path(MODEL).stat().st_size + int(1.5 * 2**30)
+            )
+            if available < required:
+                raise RuntimeError(
+                    f"Qwen GGUF needs {required / 2**30:.1f} GiB available before loading; {available / 2**30:.1f} GiB available. Close an unused app and retry."
+                )
+            self.status = "loading GGUF"
+            bridge = None
+            try:
+                torch.set_num_threads(4)
+                bridge = Bridge(str(Path(MODEL).expanduser().resolve()))
+                # Prove every layer's exact tensor name, type and shape before advertising readiness.
+                bridge.run(bridge.tokenize("Hello"), observe=True, residual=True)
+                self.model, self.tok, self.dev = bridge, Tokenizer(bridge), "cpu"
+                self.status = "ready"
+            except Exception as e:
+                if bridge:
+                    bridge.close()
+                self.status = f"error: {e}"
+                raise
+
+    def capabilities(self):
+        return {
+            "backend": "llama.cpp b11669 (CPU GGUF)",
+            "adapter": "qwen35 ffn_swiglu → ffn_down",
+            "validated": self.model is not None,
+            "layers": ARCH["n_layers"],
+            "neurons_per_layer": ARCH["inter"],
+            "capabilities": {
+                "activations": True,
+                "additive_steering": True,
+                "multiplicative_steering": True,
+                "logit_lens": True,
+                "weight_connections": False,
+                "attention_heads": [0] * ARCH["n_layers"],
+            },
+            "dose_units": "median reference residual norm / dequantized output-projection column norm; quantized matmul adds numerical error",
+            "context_tokens": 2048,
+            "generation": "three independent greedy rows, sequential on CPU",
+            "note": "Quantized checkpoint calibration is separate from the author's original Qwen data. Connection heuristics, head ablation and full lens indexing are not implemented for GGUF.",
+        }
+
+    def n_heads(self, layer):
+        self.validate_coordinate(layer)
+        return 0
+
+    def _check_heads(self, heads):
+        if heads:
+            raise ValueError("GGUF attention-head interventions are not implemented")
+
+    def _ids(self, text, chat):
+        ids = self.chat_ids(text) if chat else self.tok(text).input_ids
+        if not 1 <= len(ids) <= 2048:
+            raise ValueError("GGUF probes require 1..2048 input tokens")
+        return ids
+
+    def down_col(self, layer, n):
+        self.validate_coordinate(layer, n)
+        self.ensure_loaded()
+        with self.lock:
+            return torch.from_numpy(self.model.column(layer, n))
+
+    def _layer_resid_p50(self, layer):
+        self.validate_coordinate(layer)
+        if layer not in self.resid_p50:
+            self.ensure_loaded()
+            path = Path(self.cache_dir) / "gguf_residual_norms.json"
+            if path.exists():
+                self.resid_p50.update(
+                    {int(k): float(v) for k, v in json.loads(path.read_text()).items()}
+                )
+            else:
+                ids = self.tok(REFERENCE_TEXT).input_ids[:128]
+                _, _, res = self.model.run(ids, residual=True)
+                # Same lower-median convention as torch.median in the Transformers backend.
+                self.resid_p50 = {
+                    i: float(torch.from_numpy(r[1:]).median())
+                    for i, r in enumerate(res)
+                }
+                path.write_text(json.dumps(self.resid_p50, indent=2) + "\n")
+        return self.resid_p50[layer]
+
+    def _pushes(self, pushes, sign=1):
+        out = []
+        for l, n, dose, mode in pushes or []:
+            self.validate_coordinate(l, n)
+            if mode not in {"add", "mul"} or not np.isfinite(dose):
+                raise ValueError("Use a finite dose and mode add or mul")
+            if n is None and mode != "mul":
+                raise ValueError("Whole-layer interventions must multiply")
+            if mode == "mul":
+                value = 1.0 if sign == 0 else sign * dose
+            elif sign == 0 or dose == 0:
+                value = 0.0
+            else:
+                norm = float(self.down_col(l, n).norm())
+                if norm <= 1e-12:
+                    raise ValueError("Cannot normalize a zero write vector")
+                value = sign * dose * self.layer_resid_p50(l) / norm
+            if not np.isfinite(np.float32(value)):
+                raise ValueError("Intervention exceeds float32 range")
+            out.append((l, n, mode, value))
+        return out
+
+    def read(self, layer, n, text, chat=True, pushes=None, heads=None):
+        self.validate_coordinate(layer, n)
+        self._check_heads(heads)
+        self.ensure_loaded()
+        with self.lock:
+            ids = self._ids(text, chat)
+            _, act, _ = self.model.run(
+                ids, read=(layer, n), pushes=self._pushes(pushes)
+            )
+            units = []
+            for text, idx in self.token_units(ids):
+                vals = [float(act[i]) for i in idx]
+                units.append({"text": text, "act": max(vals, key=abs), "pieces": vals})
+            return {"units": units}
+
+    def full_activations(self, ids):
+        self.ensure_loaded()
+        if len(ids) * ARCH["n_layers"] * ARCH["inter"] * 4 > 160 << 20:
+            raise ValueError(
+                "Full GGUF activation capture exceeds the 160 MiB probe budget"
+            )
+        with self.lock:
+            return self.model.run(ids, full=True)[1]
+
+    def all_activations(self, ids, skip_first=False):
+        a = self.full_activations(ids)[:, int(skip_first) :, :]
+        return {
+            l: (
+                torch.from_numpy(v.max(0)),
+                torch.from_numpy(v.argmax(0)),
+                torch.from_numpy(v.min(0)),
+                torch.from_numpy(v.argmin(0)),
+            )
+            for l, v in enumerate(a)
+        }
+
+    def next_logprobs(self, text, chat=True, prefix="", pushes=None, heads=None):
+        self._check_heads(heads)
+        self.ensure_loaded()
+        with self.lock:
+            ids = (
+                self._ids(text, chat)
+                + self.tok(prefix, add_special_tokens=False).input_ids
+                if prefix
+                else self._ids(text, chat)
+            )
+            base = torch.log_softmax(torch.from_numpy(self.model.run(ids)[0]), -1)
+            changed = (
+                torch.log_softmax(
+                    torch.from_numpy(
+                        self.model.run(ids, pushes=self._pushes(pushes))[0]
+                    ),
+                    -1,
+                )
+                if pushes
+                else None
+            )
+            return base, changed
+
+    def steer_multi(self, pushes, rows_messages, max_new=200, cancel=None):
+        if len(rows_messages) != 3 or not 1 <= max_new <= 1024:
+            raise ValueError(
+                "Steering needs three conversations and 1..1024 new tokens"
+            )
+        self.ensure_loaded()
+        with self.lock:
+            seqs = [self.messages_ids(m) for m in rows_messages]
+            if any(not q or len(q) + max_new > 2048 for q in seqs):
+                raise ValueError(
+                    "Prompt plus generation exceeds this GGUF runtime's 2048-token context"
+                )
+            for row, (ids, sign) in enumerate(zip(seqs, (1, 0, -1))):
+                if cancel is not None and cancel.is_set():
+                    break
+                ps = self._pushes(pushes, sign)
+                logits = self.model.run(ids, pushes=ps)[0]
+                generated, sent = [], ""
+                for step in range(max_new):
+                    if cancel is not None and cancel.is_set():
+                        break
+                    token = int(logits.argmax())
+                    if self.model.lib.syn_eog(self.model.handle, token):
+                        break
+                    generated.append(token)
+                    text = self.tok.decode(generated, skip_special_tokens=True)
+                    if not text.endswith("\ufffd"):
+                        yield row, text[len(sent) :]
+                        sent = text
+                    if step + 1 < max_new:
+                        logits = self.model.run([token], reset=False, pushes=ps)[0]
+        yield None, None
+
+    def lens(self, layer, n, k=16):
+        self.validate_coordinate(layer, n)
+        self.ensure_loaded()
+        with self.lock:
+            key = (layer, n, k)
+            if key not in self._lens_cache:
+                logits = self.model.lens(layer, n)
+                order = np.argsort(logits)
+                self._lens_cache[key] = {
+                    "up": [self.tok.decode([t]) for t in order[-k:][::-1]],
+                    "down": [self.tok.decode([t]) for t in order[:k]],
+                }
+            return self._lens_cache[key]
+
+    def connections(self, layer, n, k=24, lens_k=5):
+        self.validate_coordinate(layer, n)
+        return {
+            "up": [],
+            "down": [],
+            "available": False,
+            "reason": "GGUF connection heuristic has not been implemented",
+        }
+
+    def vocab_strings(self):
+        self.ensure_loaded()
+        with self.lock:
+            if getattr(self, "_vocab", None) is None:
+                self._vocab = [self.tok.decode([i]) for i in range(len(self.tok))]
+            return self._vocab
+
+    def build_lens_index(self, *args, **kwargs):
+        raise ValueError(
+            "Full GGUF lens indexing is not implemented; per-neuron lens works on demand"
+        )
+
+    def build_act_scale(self, *args, **kwargs):
+        raise ValueError(
+            "GGUF uses the bounded fixed-reference calibration; corpus sweeps are not implemented"
+        )

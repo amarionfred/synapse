@@ -9,6 +9,7 @@ MODEL = os.getenv("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
 REVISION = os.getenv("EXPLORER_REVISION", "main")
 NO_MODEL = os.getenv("EXPLORER_NO_MODEL", "0").lower() in {"1", "true", "yes"}
 BUNDLED = os.getenv("EXPLORER_BUNDLED_CACHE", "0") == "1"
+GGUF = MODEL.lower().endswith(".gguf")
 if BUNDLED and (MODEL != "Qwen/Qwen3.5-4B" or not NO_MODEL):
     raise ValueError("Bundled author data is a Qwen3.5-4B cache-only exhibit; never live calibration.")
 
@@ -59,6 +60,14 @@ def configure():
         identity, key = {"model": MODEL, "revision": "author-bundle-f79b2196", "schema": 1}, "author-qwen35-4b"
         cache = ROOT / "explorer/cache"
         config = None
+    elif GGUF:
+        from gguf_metadata import describe, identity as gguf_identity
+        path = Path(MODEL).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError(f"GGUF file does not exist: {path}")
+        config, arch = None, describe(path)
+        identity, key = gguf_identity(path)
+        cache = ROOT / ".synapse/models" / key / "cache"
     else:
         from transformers import AutoConfig
         config = AutoConfig.from_pretrained(MODEL, revision=REVISION, trust_remote_code=False)

@@ -31,6 +31,7 @@ header { position: fixed; inset: 0 0 auto 0; height: 44px; display: flex; align-
 #model-open { color: var(--up); font-weight: 650; letter-spacing: .04em; }
 #model-dialog { color: var(--ink); background: #0e1217; border: 1px solid var(--line); border-radius: 12px; padding: 24px; width: min(620px, 92vw); max-height: 85vh; }
 #model-dialog::backdrop { background: #000a; }
+#active-checkpoint { max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--up); font-size: 11px; }
 #model-dialog h2 { margin-top: 0; color: var(--up); }
 #model-dialog input { display: block; width: 100%; margin-top: 8px; }
 #model-dialog pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.6 var(--mono); max-height: 200px; overflow: auto; }
