@@ -1,4 +1,4 @@
-"""Native Qwen3.5 GGUF inspection. Operations share one serialized CPU context."""
+"""Native Qwen3.5 GGUF weights; generation is a separate, admitted resource."""
 
 import json
 from pathlib import Path
@@ -14,6 +14,19 @@ from connection_graph import rank_connections, walk_connections, reached_nodes
 
 
 class GGUFRuntime(Runtime):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.inspector = None
+
+    def inspection_bridge(self):
+        """Called under self.lock. Never loads inference or takes its CPU slot."""
+        if self.model is not None:
+            return self.model
+        if self.inspector is None:
+            torch.set_num_threads(4)
+            self.inspector = Bridge(str(Path(MODEL).expanduser().resolve()), weights_only=True)
+        return self.inspector
+
     def ensure_loaded(self):
         with self.lock:
             if self.model is not None:
@@ -55,6 +68,9 @@ class GGUFRuntime(Runtime):
             bridge = None
             try:
                 torch.set_num_threads(4)
+                if self.inspector is not None:
+                    self.inspector.close()
+                    self.inspector = None
                 bridge = Bridge(str(Path(MODEL).expanduser().resolve()))
                 # Prove every layer's exact tensor name, type and shape before advertising readiness.
                 bridge.run(bridge.tokenize("Hello"), observe=True, residual=True)
@@ -71,6 +87,9 @@ class GGUFRuntime(Runtime):
             "backend": "llama.cpp b11669 (CPU GGUF)",
             "adapter": "qwen35 ffn_swiglu → ffn_down",
             "validated": self.model is not None,
+            "inference_loaded": self.model is not None,
+            "inspection_loaded": self.model is not None or self.inspector is not None,
+            "inspection_mode": "read-only mmap + vocabulary; no inference context",
             "layers": ARCH["n_layers"],
             "neurons_per_layer": ARCH["inter"],
             "capabilities": {
@@ -90,7 +109,7 @@ class GGUFRuntime(Runtime):
                 "max_expansions_per_request": 12,
             },
             "generation": "three independent greedy rows, sequential on CPU",
-            "note": "Connections are computed from this GGUF's gate/up/down weights on selection and cached. Head ablation and whole-model lens indexing are not implemented. Quantized calibration is separate from the author's data.",
+            "note": "Links and labels use this GGUF's read-only weights without inference loading; hover is cache-only. Activations and steering still require admitted inference. Head ablation and whole-model lens indexing are not implemented. Quantized calibration is separate from the author's data.",
         }
 
     def n_heads(self, layer):
@@ -109,9 +128,8 @@ class GGUFRuntime(Runtime):
 
     def down_col(self, layer, n):
         self.validate_coordinate(layer, n)
-        self.ensure_loaded()
         with self.lock:
-            return torch.from_numpy(self.model.column(layer, n))
+            return torch.from_numpy(self.inspection_bridge().column(layer, n))
 
     def _layer_resid_p50(self, layer):
         self.validate_coordinate(layer)
@@ -282,17 +300,18 @@ class GGUFRuntime(Runtime):
                 else:
                     result[coord] = row
             if missing:
-                self.ensure_loaded()
+                weights = self.inspection_bridge()
+                tok = Tokenizer(weights)
                 # Stream the unembedding once for a batch of directions. No full
                 # FP32 checkpoint or whole-model lens index is allocated.
                 directions = torch.from_numpy(
-                    np.stack([self.model.column(*c) for c in missing], axis=1)
+                    np.stack([weights.column(*c) for c in missing], axis=1)
                 )
                 gain = torch.from_numpy(
-                    self.model.weight_rows("output_norm.weight", 0, 1)[0]
+                    weights.weight_rows("output_norm.weight", 0, 1)[0]
                 )
                 scales = (
-                    (directions.double().square().mean(0) + self.model.rms_epsilon)
+                    (directions.double().square().mean(0) + weights.rms_epsilon)
                     .rsqrt()
                     .float()
                 )
@@ -304,13 +323,13 @@ class GGUFRuntime(Runtime):
                     )
                     for side in ("up", "down")
                 }
-                for start in range(0, self.model.vocab, 1024):
-                    weights = torch.from_numpy(
-                        self.model.weight_rows(
-                            "output.weight", start, min(1024, self.model.vocab - start)
+                for start in range(0, weights.vocab, 1024):
+                    rows = torch.from_numpy(
+                        weights.weight_rows(
+                            "output.weight", start, min(1024, weights.vocab - start)
                         )
                     )
-                    logits = weights @ directions
+                    logits = rows @ directions
                     for side, sign in (("up", 1), ("down", -1)):
                         val, idx = (sign * logits).topk(min(32, len(logits)), dim=0)
                         old_val, old_idx = best[side]
@@ -323,7 +342,7 @@ class GGUFRuntime(Runtime):
                 for i, coord in enumerate(missing):
                     row = {
                         side: [
-                            self.tok.decode([t]) for t in best[side][1][:, i].tolist()
+                            tok.decode([t]) for t in best[side][1][:, i].tolist()
                         ]
                         for side in ("up", "down")
                     }
@@ -346,9 +365,9 @@ class GGUFRuntime(Runtime):
             data = self._cached(key)
             cached = data is not None
             if data is None:
-                self.ensure_loaded()
+                weights = self.inspection_bridge()
                 started = time.monotonic()
-                gate, up = self.model.connection_vectors(layer, n)
+                gate, up = weights.connection_vectors(layer, n)
                 data = rank_connections(gate, up, layer)
                 data.update(
                     available=True,
@@ -372,6 +391,12 @@ class GGUFRuntime(Runtime):
                     label = lenses[(c["layer"], c["n"])]
                     c.update(lens=label["up"], lens_neg=label["down"])
             return out
+
+    def cached_lens(self, layer, n, k=8):
+        self.validate_coordinate(layer, n)
+        row = self._lens_cache.get((layer, n)) or self._cached(f"gguf-lens-f32-v1:{layer}:{n}")
+        return ({side: row[side][:k] for side in ("up", "down")} if row is not None
+                else {"up": [], "down": [], "pending": True})
 
     def cached_connections(self, layer, n, k=16):
         self.validate_coordinate(layer, n)

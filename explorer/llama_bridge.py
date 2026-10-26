@@ -26,7 +26,7 @@ def ptr(a, dtype=F32):
 
 
 class Bridge:
-    def __init__(self, path, hooks=True):
+    def __init__(self, path, hooks=True, *, weights_only=False):
         lib = ROOT / ".synapse/libsynapse-llama.so"
         if not lib.exists():
             raise RuntimeError(
@@ -36,6 +36,8 @@ class Bridge:
         signatures = {
             "error": (C.c_char_p, []),
             "open": (C.c_void_p, [C.c_char_p, C.c_char_p, C.c_int, C.c_bool]),
+            "open_inspection": (C.c_void_p, [C.c_char_p, C.c_char_p]),
+            "has_context": (C.c_bool, [C.c_void_p]),
             "close": (None, [C.c_void_p]),
             "vocab": (C.c_int, [C.c_void_p]),
             "tokenize": (
@@ -74,22 +76,23 @@ class Bridge:
         meta = metadata(path)
         self.chat_template = meta.get("tokenizer.chat_template")
         self.rms_epsilon = meta.get("qwen35.attention.layer_norm_rms_epsilon", 1e-6)
-        self.lease = open(ROOT / ".synapse/local-model-cpu.lock", "a")
-        try:
-            fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            self.lease.close()
-            raise RuntimeError(
-                "Another local Qwen runtime owns the CPU model slot. Stop qwen-lab or Synapse before switching."
-            ) from None
-        self.handle = self.lib.syn_open(
-            str(path).encode(),
-            str(ROOT / "runtime/llama/llama-b11669").encode(),
-            4,
-            hooks,
-        )
+        self.weights_only = weights_only
+        self.lease = None
+        if not weights_only:
+            self.lease = open(ROOT / ".synapse/local-model-cpu.lock", "a")
+            try:
+                fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.lease.close()
+                raise RuntimeError(
+                    "Another local Qwen runtime owns the CPU model slot. Stop qwen-lab or Synapse before switching."
+                ) from None
+        args = (str(path).encode(), str(ROOT / "runtime/llama/llama-b11669").encode())
+        self.handle = (self.lib.syn_open_inspection(*args) if weights_only
+                       else self.lib.syn_open(*args, 4, hooks))
         if not self.handle:
-            self.lease.close()
+            if self.lease:
+                self.lease.close()
             raise RuntimeError(self.lib.syn_error().decode())
         self.vocab = self.lib.syn_vocab(self.handle)
         self._pieces = {}
@@ -98,7 +101,8 @@ class Bridge:
         if self.handle:
             self.lib.syn_close(self.handle)
             self.handle = None
-            self.lease.close()
+            if self.lease:
+                self.lease.close()
 
     def check(self, rc):
         if rc < 0:

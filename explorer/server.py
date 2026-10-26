@@ -12,7 +12,7 @@ import threading
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -64,6 +64,34 @@ async def no_store(request, call_next):
 
 rt = Runtime(STATS)
 _cache = {}
+
+
+async def inspection_call(request, operation, *args):
+    """Do not put abandoned selections into the native runtime's thread queue.
+
+    An already running bounded scan finishes and can populate the cache. Hold
+    the gate until that worker really finishes, even if its caller is cancelled.
+    Hover bypasses this gate because it only reads cached data.
+    """
+    if request is None:
+        return await asyncio.to_thread(operation, *args)
+    gate = request.app.state.inspection_gate
+    await gate.acquire()
+    work = None
+    try:
+        if await request.is_disconnected():
+            raise HTTPException(499, "Selection request disconnected")
+        work = asyncio.create_task(asyncio.to_thread(operation, *args))
+        return await asyncio.shield(work)
+    finally:
+        if work is None or work.done():
+            gate.release()
+        else:
+            def finished(task):
+                if not task.cancelled():
+                    task.exception()
+                gate.release()
+            work.add_done_callback(finished)
 
 
 def layer_runs():
@@ -217,8 +245,8 @@ def rollout(layer: int, i: int):
 
 
 @app.get("/api/connections")
-async def connections(layer: int, n: int, k: int = 24, lens: int = 5):
-    out = await asyncio.to_thread(rt.connections, layer, n, k, lens)
+async def connections(layer: int, n: int, k: int = 24, lens: int = 5, request: Request = None):
+    out = await inspection_call(request, rt.connections, layer, n, k, lens)
     words = await asyncio.to_thread(lambda: {l: ranked_words(l) for l in {c["layer"] for c in out["down"] + out["up"]}})
     nm = names()
     out = {**out, **{side: [dict(c) for c in out[side]] for side in ("down", "up")}}
@@ -230,15 +258,15 @@ async def connections(layer: int, n: int, k: int = 24, lens: int = 5):
 
 @app.get("/api/hover")
 async def hover(layer: int, n: int):
-    con = await asyncio.to_thread(rt.cached_connections, layer, n, 16) if hasattr(rt, "cached_connections") else await asyncio.to_thread(rt.connections, layer, n, 16, 0)
-    lens = await asyncio.to_thread(rt.lens, layer, n, 8)
+    con = await asyncio.to_thread(rt.cached_connections, layer, n, 16)
+    lens = await asyncio.to_thread(rt.cached_lens, layer, n, 8)
     return {"lens": lens["up"], "lens_neg": lens["down"], "steer": lens.get("steer_up"), "steer_neg": lens.get("steer_down"),
-            "con": con}
+            "con": con, "pending": bool(con.get("pending") or lens.get("pending"))}
 
 
 @app.get("/api/lens")
-async def lens(layer: int, n: int):
-    return await asyncio.to_thread(rt.lens, layer, n, 12)
+async def lens(layer: int, n: int, request: Request):
+    return await inspection_call(request, rt.lens, layer, n, 12)
 
 
 @app.post("/api/reads")
@@ -527,6 +555,10 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
 
 
 @app.get("/api/web")
+async def web_request(request: Request, layer: int, n: int, first: int = 5, k: int = 2, zmin: float = 15, cap: int = 20000, hops: int = 0):
+    return await inspection_call(request, web, layer, n, first, k, zmin, cap, hops)
+
+
 def web(layer: int, n: int, first: int = 5, k: int = 2, zmin: float = 15, cap: int = 20000, hops: int = 0):
     """The cone for the map. Binary int32, 6 per link: src layer, src neuron, dst layer, dst neuron,
     round(10 * z) * sign, hop."""
@@ -544,6 +576,10 @@ _idf = {}
 
 
 @app.get("/api/web/summary")
+async def web_summary_request(request: Request, layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, src: str = "steer", hops: int = 0):
+    return await inspection_call(request, web_summary, layer, n, first, k, top, src, hops)
+
+
 def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, src: str = "steer", hops: int = 0):
     """What the neuron's web says, in tokens. Each neuron in the cone is read on the pole the chain drives (signs
     multiplied along the path from the open neuron), and its steer (or logit) lens tokens are pooled, merged across
@@ -1146,6 +1182,7 @@ app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), h
 
 @app.on_event("startup")
 def preload():
+    app.state.inspection_gate = asyncio.Lock()
     def go():
         if NO_MODEL:
             rt.status = "cache only"

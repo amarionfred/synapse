@@ -62,6 +62,12 @@ Click a neighbor to follow it, or choose **2 hops** / **3 hops** to expand the w
 Scores and labels are cached per checkpoint, so returning to a neighborhood is fast.
 Each expansion request is bounded to 12 source neurons and reports any truncation.
 Hovering uses cached links and does not queue a new whole-network calculation.
+GGUF selection works before inference is loaded: a vocabulary-only loader and
+read-only mapping stream bounded weight chunks for links and token labels.
+Hover reads only existing links and labels; select a neuron to compute missing
+data. Changing selection clears old results and cancels its requests. A scan
+already running may finish into the cache; disconnected requests waiting to
+start are skipped.
 
 The connection score matches the original gated-MLP direct-path method:
 `g = gate_reader · (norm_gain_reader * down_writer)` and likewise `u` for the up
@@ -72,7 +78,7 @@ summaries use weighted counts over the shown neighbors; layerwise token-frequenc
 lift requires a whole-model index. These links describe weight alignment.
 
 This CPU backend uses a 2,048-token context and generates the three steering rows
-sequentially. Loading needs at least 4.25 GiB available RAM after Python starts
+sequentially. Loading inference needs at least 4.25 GiB available RAM after Python starts
 (more for larger files), based on the measured 3.7 GiB full-process connection/lens check.
 Synapse and `qwen-lab` share a process lock so they cannot load two Qwen contexts
 at once. Stop Synapse before returning to `qwen-lab chat`. Calibration, neuron
@@ -176,6 +182,14 @@ from both directions, checks unchanged logits, and compares batched/scalar lens
 labels. Run it with the model services stopped. With Synapse running,
 `scripts/verify_connection_view.py` checks link lists, caching, binary map edges,
 two-hop expansion, summaries and the agent cone endpoint. Use the project Python.
+
+`scripts/verify_gguf_inspection.py` uses a new isolated cache, forbids inference,
+and checks early/middle/final-layer selections, lens agreement, the model hash,
+and process peak RSS. Its optional `--reference <inspection-run-directory>`
+compares the same vectors/lens with the inference path and checks unchanged
+baseline logits, behind the normal inference admission check. Run that mode
+with model services stopped and under the service memory bound. These are
+bounded implementation checks, not a capability experiment.
 
 Park's Qwen3.5-4B Q4_K_M and OpenCode installation remains available through
 `qwen-lab chat`; its server has a separate 5 GiB available-RAM gate. The detailed

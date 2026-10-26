@@ -396,6 +396,30 @@ class Runtime:
             self._steer_idx = dict(np.load(path)) if os.path.exists(path) else False
         return self._steer_idx or None
 
+    def cached_lens(self, layer, n, k=8):
+        self.validate_coordinate(layer, n)
+        idx = self.lens_index()
+        if (idx is not None and k <= idx["up"].shape[-1]
+                and (getattr(self, "_vocab", None) is not None
+                     or os.path.exists(os.path.join(self.cache_dir, "vocab.json")))):
+            return self.lens(layer, n, k)
+        for (l, neuron, count), row in list(self._lens_cache.items()):
+            if (l, neuron) == (layer, n) and count >= k:
+                return {side: row[side][:k] for side in ("up", "down")}
+        return {"up": [], "down": [], "pending": True}
+
+    def cached_connections(self, layer, n, k=16):
+        self.validate_coordinate(layer, n)
+        ci = self.con_index()
+        if ci is not None and k <= ci["k"]:
+            return self.connections(layer, n, k, 0)
+        for (l, neuron, count, _), row in list(self._con_cache.items()):
+            if (l, neuron) == (layer, n) and count >= k:
+                return {**row, **{side: row[side][:k] for side in ("up", "down")}}
+        with self._db_lock:
+            row = self._db.execute("SELECT val FROM con WHERE key = ?", (f"{layer}:{n}:{k}:0",)).fetchone()
+        return json.loads(row[0]) if row else {"up": [], "down": [], "pending": True}
+
     def lens(self, layer, n, k=16):
         self.validate_coordinate(layer, n)
         idx = self.lens_index()

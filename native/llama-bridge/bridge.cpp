@@ -27,6 +27,7 @@ struct Engine {
   ggml_context *tensors = nullptr;
   void *map = MAP_FAILED;
   size_t bytes = 0;
+  bool weights_only = false;
   int layers = 0, hidden = 0, inter = 0, vocab = 0, offset = 0, total = 0;
   int read_layer = -1, read_neuron = -1;
   float *acts = nullptr, *residuals = nullptr;
@@ -35,6 +36,12 @@ struct Engine {
   int n_push = 0;
   std::vector<int> visits, resid_visits;
   std::string failure;
+  // Inspection streams read-only file pages. Drop this mapping's resident pages
+  // between bounded chunks; the kernel's shared file cache remains reusable.
+  void release_pages() {
+    if (weights_only && map != MAP_FAILED)
+      madvise(map, bytes, MADV_DONTNEED);
+  }
   ~Engine() {
     if (ctx)
       llama_free(ctx);
@@ -103,6 +110,7 @@ struct Engine {
         throw std::runtime_error("Unsupported column quantizer");
       out[r] = buf[neuron % block];
     }
+    release_pages();
   }
 };
 
@@ -174,14 +182,13 @@ static bool callback(ggml_tensor *t, bool ask, void *user) {
   return true;
 }
 
-extern "C" {
-const char *syn_error() { return error.c_str(); }
-void *syn_open(const char *path, const char *backend_dir, int threads,
-               bool hooks) {
+static void *open_engine(const char *path, const char *backend_dir, int threads,
+                         bool hooks, bool weights_only) {
   try {
     ggml_backend_load_all_from_path(backend_dir);
     llama_backend_init();
     auto e = std::make_unique<Engine>();
+    e->weights_only = weights_only;
     e->gguf = gguf_init_from_file(path, {true, &e->tensors});
     if (!e->gguf)
       throw std::runtime_error("Cannot read GGUF");
@@ -206,13 +213,42 @@ void *syn_open(const char *path, const char *backend_dir, int threads,
     auto mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
     mp.load_mode = LLAMA_LOAD_MODE_MMAP;
+    mp.vocab_only = weights_only;
     e->model = llama_model_load_from_file(path, mp);
     if (!e->model)
       throw std::runtime_error("llama.cpp failed to load weights");
     e->layers = llama_model_n_layer(e->model);
     e->hidden = llama_model_n_embd(e->model);
+    if (weights_only) {
+      // vocab_only intentionally skips llama.cpp's architecture hparams.
+      // Read the dimension metadata from the same GGUF directory instead.
+      auto dimension = [&](const char *key) {
+        auto i = gguf_find_key(e->gguf, key);
+        if (i < 0 || gguf_get_kv_type(e->gguf, i) != GGUF_TYPE_UINT32)
+          throw std::runtime_error(std::string("Missing GGUF dimension: ") + key);
+        auto n = gguf_get_val_u32(e->gguf, i);
+        if (n == 0 || n > 1000000)
+          throw std::runtime_error(std::string("Invalid GGUF dimension: ") + key);
+        return int(n);
+      };
+      e->layers = dimension("qwen35.block_count");
+      e->hidden = dimension("qwen35.embedding_length");
+    }
     e->inter = e->tensor("blk.0.ffn_down.weight")->ne[0];
     e->vocab = llama_vocab_n_tokens(llama_model_get_vocab(e->model));
+    if (weights_only) {
+      // The vocabulary-only llama model supplies the checkpoint tokenizer and
+      // metadata. All weight access uses our mapping, with no tensor buffers,
+      // repacking, KV cache, graph or generation context in llama.cpp.
+      for (int l = 0; l < e->layers; ++l) {
+        const auto p = "blk." + std::to_string(l) + ".";
+        e->matrix(p + "ffn_down.weight", e->inter, e->hidden);
+        e->matrix(p + "ffn_gate.weight", e->hidden, e->inter);
+        e->matrix(p + "ffn_up.weight", e->hidden, e->inter);
+        e->matrix(p + "post_attention_norm.weight", e->hidden, 1);
+      }
+      return e.release();
+    }
     auto cp = llama_context_default_params();
     cp.n_ctx = 2048;
     cp.n_batch = 64;
@@ -233,6 +269,15 @@ void *syn_open(const char *path, const char *backend_dir, int threads,
     return nullptr;
   }
 }
+extern "C" {
+const char *syn_error() { return error.c_str(); }
+void *syn_open(const char *path, const char *backend_dir, int threads, bool hooks) {
+  return open_engine(path, backend_dir, threads, hooks, false);
+}
+void *syn_open_inspection(const char *path, const char *backend_dir) {
+  return open_engine(path, backend_dir, 1, false, true);
+}
+bool syn_has_context(void *ptr) { return static_cast<Engine *>(ptr)->ctx != nullptr; }
 void syn_close(void *ptr) { delete static_cast<Engine *>(ptr); }
 int syn_vocab(void *ptr) { return static_cast<Engine *>(ptr)->vocab; }
 int syn_tokenize(void *ptr, const char *text, int len, int *out, int cap,
@@ -255,6 +300,8 @@ int syn_eval(void *ptr, int *ids, int count, bool reset, bool observe,
              float *acts, float *residuals, float *logits) {
   auto &e = *static_cast<Engine *>(ptr);
   try {
+    if (!e.ctx)
+      throw std::runtime_error("Weight-only inspection has no inference context");
     if (count < 1 || count > 2048)
       throw std::runtime_error("Probe needs 1..2048 tokens");
     if (acts && !full &&
@@ -318,7 +365,8 @@ int syn_eval(void *ptr, int *ids, int count, bool reset, bool observe,
     e.pushes = nullptr;
     e.n_push = 0;
     e.acts = e.residuals = nullptr;
-    llama_memory_clear(llama_get_memory(e.ctx), true);
+    if (e.ctx)
+      llama_memory_clear(llama_get_memory(e.ctx), true);
     return -1;
   }
 }
@@ -346,6 +394,7 @@ int syn_rows(void *ptr, const char *name, int start, int count, int width,
     const char *base = e.data(t);
     for (int r = 0; r < count; ++r)
       e.row_from(t, base, start + r, out + size_t(r) * width);
+    e.release_pages();
     return 0;
   } catch (const std::exception &ex) {
     error = ex.what();
@@ -419,6 +468,7 @@ int syn_connections(void *ptr, int layer, int neuron, int size, float *gate_out,
           u[n] = uu[n];
         }
       }
+      e.release_pages();
     }
     return 0;
   } catch (const std::exception &ex) {
@@ -456,7 +506,10 @@ int syn_lens(void *ptr, int layer, int neuron, float *out) {
       for (int j = 0; j < e.hidden; ++j)
         dot += double(row[j]) * d[j];
       out[i] = dot;
+      if (i % 1024 == 1023)
+        e.release_pages();
     }
+    e.release_pages();
     return 0;
   } catch (const std::exception &ex) {
     error = ex.what();

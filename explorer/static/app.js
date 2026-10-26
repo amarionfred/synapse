@@ -2,8 +2,8 @@ import { createMap } from "./map3d.js?v=69";
 import { createScatter } from "./scatter.js?v=39";
 
 const $ = s => document.querySelector(s);
-const api = async (p, body) => {
-  const r = await fetch(p, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+const api = async (p, body, signal) => {
+  const r = await fetch(p, { signal, ...(body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}) });
   if (!r.ok) throw new Error(`${p.split("?")[0]} ${r.status}: ${(await r.text()).slice(0, 160)}`);
   return r.json();
 };
@@ -60,11 +60,12 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
   onHover: (p, x, y) => {
     if (!p) return hideTip();
     if (p.type === "block") {
-      if (hoverKey) { hoverKey = null; map.setHoverConnections(null); }
+      hideTip();
       const full = p.full;
       return showTip(x, y, `L${p.layer}`, full ? `${arch.layer_types[p.layer].replaceAll("_", " ")} · ${arch.attn_heads} q / ${arch.kv_heads} kv heads` : `linear attention · ${arch.linear_k_heads} k / ${arch.linear_v_heads} v heads`);
     }
     const u = state.unitMap[p.layer]?.get(p.n), key = `${p.layer}/${p.n}`;
+    if (hoverKey !== key) { hoverController?.abort(); hoverController = null; }
     const head = `L${p.layer} N${p.n}${u ? `  mass ${u.z.toFixed(1)}` : ""}`;
     const body = () => {
       const h = hoverCache.get(key), rows = [];
@@ -72,16 +73,28 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
       if (u) rows.push(`<div class="twords">${esc(u.words.join("  "))}</div>`);
       if (h && h.steer) rows.push(`<div class="tl"><span class="sgn up">+</span>${esc(h.steer.join("  "))}</div><div class="tl"><span class="sgn down">−</span>${esc(h.steer_neg.join("  "))}</div>`);
       if (h) rows.push(`<div class="tl faintline"><span class="sgn up">+</span>${esc(h.lens.join("  "))}</div><div class="tl faintline"><span class="sgn down">−</span>${esc(h.lens_neg.join("  "))}</div>`);
+      if (h?.pending) rows.push(`<div class="dim">Select to inspect this neuron.</div>`);
       return rows.join("");
     };
     showTipHTML(x, y, head, body());
     clearTimeout(hoverTimer);
     hoverTimer = setTimeout(async () => {
-      if (!hoverCache.has(key)) hoverCache.set(key, await api(`/api/hover?layer=${p.layer}&n=${p.n}`));
-      if (hoverKey !== key) return;
-      // with a neuron open, hover only shows the tooltip; its connections and web stay on screen
-      if (!(state.focus && state.focus.kind === "neuron")) map.setHoverConnections({ layer: p.layer, n: p.n }, hoverCache.get(key).con);
-      showTipHTML(x, y, head, body());
+      if (hoverController) return;
+      const ctl = new AbortController(); hoverController = ctl;
+      try {
+        if (!hoverCache.has(key)) {
+          const preview = await api(`/api/hover?layer=${p.layer}&n=${p.n}`, null, ctl.signal);
+          if (ctl.signal.aborted || hoverKey !== key) return;
+          if (hoverCache.size >= 256) hoverCache.delete(hoverCache.keys().next().value);
+          hoverCache.set(key, preview);
+        }
+        if (ctl.signal.aborted || hoverKey !== key) return;
+        // A preview never changes the selected neuron's connections or web.
+        if (!(state.focus && state.focus.kind === "neuron")) map.setHoverConnections({ layer: p.layer, n: p.n }, hoverCache.get(key).con);
+        showTipHTML(x, y, head, body());
+      } catch (err) {
+        if (!ctl.signal.aborted && hoverKey === key) showTip(x, y, head, "Preview unavailable. Select to retry.");
+      } finally { if (hoverController === ctl) hoverController = null; }
     }, 120);
     hoverKey = key;
   },
@@ -96,9 +109,10 @@ function showTipHTML(x, y, head, html) {
 }
 function hideTip() {
   tip.style.display = "none";
-  if (hoverKey) { hoverKey = null; clearTimeout(hoverTimer); map.setHoverConnections(null); }
+  hoverController?.abort(); hoverController = null;
+  hoverKey = null; clearTimeout(hoverTimer); map.setHoverConnections(null);
 }
-let hoverTimer, hoverKey = null;
+let hoverTimer, hoverKey = null, hoverController = null;
 const hoverCache = new Map();
 // tip lives in the embed view section; lift it to body so the map can use it too
 document.body.appendChild(tip);
@@ -128,7 +142,7 @@ const connectionsAvailable = index.runtime?.capabilities?.weight_connections !==
 const liveConnections = index.runtime?.connection_mode === "on-demand";
 if (liveConnections) document.querySelector('#web-depth option[value="0"]').remove();
 $("#web-depth").value = String(Number(new URLSearchParams(location.search).get("webhops")) || (liveConnections ? 1 : 0));
-let webOn = connectionsAvailable, webKey = null;
+let webOn = connectionsAvailable, webKey = null, webController = null;
 if (!connectionsAvailable) {
   const on = document.querySelector('#web-mode button[data-w="on"]');
   on.disabled = true;
@@ -139,26 +153,29 @@ async function refreshWeb() {
   const f = state.focus, first = Math.max(1, Math.min(24, Math.round(Number($("#web-z").value) || 5)));
   const k = Number(new URLSearchParams(location.search).get("webk")) || 2;
   const hops = Number($("#web-depth").value);
-  if (!webOn || !f || f.kind !== "neuron") { webKey = null; state.webSum = null; map.setWeb(null); renderList(); return; }
+  if (!webOn || !f || f.kind !== "neuron") { webController?.abort(); webController = null; webKey = null; state.webSum = null; map.setWeb(null); renderList(); return; }
   const key = `${f.layer}/${f.n}/${first}/${k}/${hops}`;
   if (key === webKey) return;
+  webController?.abort();
+  const ctl = new AbortController(); webController = ctl;
+  const current = () => webController === ctl && !ctl.signal.aborted && webKey === key;
   webKey = key;
   map.setWeb(null);
   if (liveConnections) { state.webSum = {layer:f.layer,n:f.n,loading:true}; renderList(); }
   try {
-    const r = await fetch(`/api/web?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}`);
+    const r = await fetch(`/api/web?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}`, { signal: ctl.signal });
     if (!r.ok) throw new Error(await r.text());
     const edges = new Int32Array(await r.arrayBuffer());
-    if (webKey !== key) return;
+    if (!current()) return;
     $("#web-z").title = `web: the open neuron's top links each way (later hops follow ${k}) · ${r.headers.get("X-Web-Total")} links`;
     map.setWeb(edges);
     if (liveConnections) { state.webSum = {layer:f.layer,n:f.n,loading:true,message:`${r.headers.get("X-Web-Total")} links ready · reading labels…`}; renderList(); }
-    const sum = await api(`/api/web/summary?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}&top=24`);
-    if (webKey !== key) return;
+    const sum = await api(`/api/web/summary?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}&top=24`, null, ctl.signal);
+    if (!current()) return;
     state.webSum = { ...sum, layer: f.layer, n: f.n, links: r.headers.get("X-Web-Total") };
     renderList();
   } catch (err) {
-    if (webKey !== key) return;
+    if (!current()) return;
     state.webSum = {layer:f.layer,n:f.n,error:err.message}; renderList();
   }
 }
@@ -485,7 +502,7 @@ $("#focus-tab").onclick = () => focusEl.classList.contains("on") ? setFocusColla
 // ---------- focus panel ----------
 const focusEl = $("#focus");
 // closing the neuron keeps the panel up when Claude is the open tab
-$("#f-close").onclick = () => { flushName(); if (running) running.abort(); state.focus = null; $("#list").classList.remove("has-focus");
+$("#f-close").onclick = () => { flushName(); if (running) running.abort(); state.focus = null; clearSelection(); $("#list").classList.remove("has-focus");
   if (curTab() === "claude") syncTabs(); else focusEl.classList.remove("on");
   setFocusCollapsed(false); map.select(null); refreshWeb(); renderAgentActions(); scatter.select(null, null); history.replaceState(null, "", " "); renderList(); };
 document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => setTab(b.dataset.tab));
@@ -511,10 +528,21 @@ function openClaude() {
   focusEl.classList.add("on"); syncTabs(); setTab("claude"); setFocusCollapsed(false); $("#a-input").focus();
 }
 
+let selectionController = null;
+function clearSelection() {
+  selectionController?.abort(); selectionController = null;
+  webController?.abort(); webController = null; webKey = null;
+  state.con = state.lens = state.webSum = null;
+  map.select(null); scatter.select(null, null);
+  map.setConnections({up: [], down: []}); map.setWeb(null); hideTip();
+}
 async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   if (!agentSelecting) clearAgentMarks();
   flushName();
   if (running) running.abort();
+  clearSelection();
+  const ctl = new AbortController(); selectionController = ctl;
+  const current = () => selectionController === ctl && !ctl.signal.aborted;
   state.focus = { layer, n, kind };
   if (map.layerMode !== null && map.layerMode !== layer) map.enterLayer(layer);
   if (push && kind === "neuron") history.replaceState(null, "", `#L${layer}/N${n}`);
@@ -527,14 +555,16 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   $("#tab-examples").innerHTML = ""; $("#tab-details").innerHTML = "";
   state.thread = []; renderThread(); $("#c-reads").innerHTML = ""; $("#c-lens").innerHTML = "";
   syncTabs();
+  renderList();
+  try {
   if (layer !== state.layer) await setLayer(layer);
-  if (!isFocus(layer, n, kind)) return;
+  if (!current()) return;
   setNameField(state.unitMap[layer]?.get(n)?.name || "");
   renderList();
   if (kind === "neuron") { map.select(layer, n, fly); scatter.select(layer, n); }
   refreshWeb(); renderAgentActions();
-  const u = await api(`/api/unit?layer=${layer}&n=${n}&kind=${kind}`);
-  if (!isFocus(layer, n, kind)) return;
+  const u = await api(`/api/unit?layer=${layer}&n=${n}&kind=${kind}`, null, ctl.signal);
+  if (!current()) return;
   setNameField(u.name || "");
   if (u.stats) $("#f-rank").textContent = `#${u.rank ?? "—"}/${u.n_ranked}  mass ${(u.stats.mass ?? u.stats.z).toFixed(1)}  null ${(u.stats.null_pct * 100).toFixed(0)}%`;
   renderExamples(u);
@@ -542,7 +572,8 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   const hasRollouts = !!(u.rollouts && u.rollouts.length);
   document.querySelector('#tabs button[data-tab="examples"]').style.display = hasRollouts ? "" : "none";
   if (!hasRollouts && document.querySelector("#tabs button.on")?.dataset.tab === "examples") setTab("details");
-  if (kind === "neuron") loadLive(layer, n);
+  if (kind === "neuron") loadLive(layer, n, ctl);
+  } catch (err) { if (current()) $("#tab-details").textContent = err.message; }
 }
 
 const isFocus = (layer, n, kind) => state.focus && state.focus.layer === layer && state.focus.n === n && state.focus.kind === kind;
@@ -587,19 +618,21 @@ function renderDetails(u) {
   $("#tab-details").innerHTML = h;
 }
 
-async function loadLive(layer, n) {
+async function loadLive(layer, n, ctl) {
+  const current = () => selectionController === ctl && !ctl.signal.aborted;
   $("#d-lens") && ($("#d-lens").textContent = "…");
   $("#d-con") && ($("#d-con").textContent = "…");
-  const conP = api(`/api/connections?layer=${layer}&n=${n}&k=24`);
+  const conP = api(`/api/connections?layer=${layer}&n=${n}&k=24`, null, ctl.signal);
   conP.then(con => {
-    if (!isFocus(layer, n, "neuron")) return;
+    if (!current()) return;
     map.setConnections(con); state.con = con; renderConnections();
-  }, err => { if (isFocus(layer, n, "neuron") && $("#d-con")) $("#d-con").textContent = err.message; });
+  }, err => { if (current() && $("#d-con")) $("#d-con").textContent = err.message; });
   let lens;
-  try { lens = await api(`/api/lens?layer=${layer}&n=${n}`); }
-  catch (err) { if (isFocus(layer, n, "neuron") && $("#d-lens")) $("#d-lens").textContent = err.message; }
-  if (!isFocus(layer, n, "neuron")) return;
+  try { lens = await api(`/api/lens?layer=${layer}&n=${n}`, null, ctl.signal); }
+  catch (err) { if (current() && $("#d-lens")) $("#d-lens").textContent = err.message; }
+  if (!current()) return;
   if (!lens) return;
+  hoverCache.delete(`${layer}/${n}`);
   state.lens = { ...lens, layer, n }; renderList();
   const tok = t => `<span class="tok">${esc(t)}</span>`;
   const steer = lens.steer_up ? `<div class="lab">steer lens</div><div class="lens"><div class="up"><div class="lab">+ push · KL ${lens.kl_up}</div>${lens.steer_up.map(tok).join("")}</div><div class="down"><div class="lab">− push · KL ${lens.kl_down}</div>${lens.steer_down.map(tok).join("")}</div></div><div class="lab" style="margin-top:14px">logit lens</div>` : "";
