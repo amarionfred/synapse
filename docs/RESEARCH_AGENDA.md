@@ -1,6 +1,6 @@
 # What can we uncover in open weights?
 
-Park's question: can we expose useful capabilities that are present in a model but
+Amarion's question: can we expose useful capabilities that are present in a model but
 poorly expressed, by understanding and changing its internal computation?
 
 Synapse is the workspace for investigating this question together. Enthusiasm is
@@ -85,7 +85,7 @@ Use `.synapse/experiments/<date>-<question>/` for local experiment artifacts. In
 checkpoint ID/revision or weight hashes, adapter, precision, prompts and splits,
 seeds, token positions, doses, baseline and control outputs, scoring code,
 resource measurements, and a short claim/limitation statement. Agent-written
-implementation and Park's predictions or manual observations should be identified.
+implementation and Amarion's predictions or manual observations should be identified.
 
 Prediction exercise: before a probe, write whether increasing one chosen neuron's
 activation should change a specific next token, an entire semantic feature, or

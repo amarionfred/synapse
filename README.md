@@ -1,211 +1,96 @@
 # Synapse
 
-A workspace for exploring open model internals with a human and a coding agent.
-Forked from [Lyra's neuron-explorer](https://github.com/lyramakesmusic/neuron-explorer).
-It retains the 3D neuron map, per-token activations, logit lens and paired steering,
-adds **Codex CLI alongside Claude Code**, and replaces the Qwen-only loader with
-validated dense-decoder adapters.
+Synapse is a local workspace for exploring open language models with a human and
+a coding agent. Browse neurons in a 3D map, inspect what fires on your text, and
+compare model outputs with and without an intervention. **Codex CLI and Claude
+Code** can work alongside you through MCP tools that read the same checkpoint
+and control the shared view.
 
-## Start
+[![Synapse neuron map, selected-neuron details and connection links](docs/media/synapse-demo.gif)](docs/media/synapse-demo.mp4)
 
-Python 3.11+ and [uv](https://docs.astral.sh/uv/) are required. The default lock uses
-CPU PyTorch; choose an appropriate PyTorch build for a GPU installation.
+*From Amarion's October 26, 2026 recording: navigating the Qwen3.5 neuron map,
+with selected-neuron token labels and connection links visible.*
+[Watch the MP4 excerpt](docs/media/synapse-demo.mp4).
 
-```bash
-uv sync --extra dev
-python scripts/synapse.py serve --model HuggingFaceTB/SmolLM2-135M-Instruct
-```
+## What you can do
 
-Open **http://127.0.0.1:8791**. Click **synapse → Load model for live experiments**,
-or select a neuron and request an activation or steering probe. Loading happens
-on demand. No full sweep or corpus indexing runs on startup.
+- **Explore a neighborhood.** Select a neuron to see its token labels and ranked
+  upstream/downstream links. Follow a neighbor or expand the map to two or three
+  hops. Links are weight-alignment hypotheses to investigate, not proven circuits.
+- **Read a model's response to text.** Inspect per-token activations, find strongly
+  firing neurons, and compare candidates across prompts and controls.
+- **Test interventions.** Add to or multiply selected neuron activations, compare
+  steered and baseline continuations, and measure next-token probability changes.
+  Supported adapters also expose whole-MLP and attention-head ablations.
+- **Investigate with an agent.** In the Agent tab, ask Codex or Claude to inspect
+  neurons, run supported probes, select or highlight candidates, move the camera,
+  and write experiment scripts. Tool calls and results appear in the conversation.
+- **Browse quantized weights without loading inference.** The Qwen3.5 GGUF backend
+  computes missing links and logit-lens labels from the file's own weights.
+  Hover is cache-only; activation and generation probes load inference separately.
+- **Keep results tied to the model.** Checkpoint/revision identity separates caches,
+  calibration and neuron names. The server reports supported operations and loaded
+  state; the agent model is separate from the checkpoint under investigation.
+- **Explore residual interventions (experimental).** The research API implements
+  selected-layer residual capture, reversible projections and factor-archive
+  exports. See the [API and live-validation status](docs/RESIDUAL_PROJECTION.md).
 
-The small SmolLM2 checkpoint makes live exploration practical on a CPU laptop.
-It is a working research/demo model, not a substitute for a strong coding model.
-Model downloads require disk space; CPU admission estimates check available RAM.
+## Start from the checkout
 
-On Park's installed machine, the `synapse` command is on PATH:
-
-```bash
-synapse start              # bounded user service; 3 GiB (Transformers) / 5 GiB (GGUF), no swap
-synapse status             # checkpoint, actual loaded state and capabilities
-synapse codex              # interactive Codex with the same explorer MCP tools
-synapse stop
-```
-
-`start` uses a conservative 3 GiB process limit for Transformers and 5 GiB for GGUF. For a larger
-checkpoint on suitable hardware, use `serve` with an appropriate resource limit.
-Select another model using `--model <Hugging-Face-ID-or-local-folder-or-GGUF-file>` and optionally
-`--revision <commit>`. Stop the existing process first. Selection is remembered
-locally; the **synapse** dialog generates the launch command.
-
-For the installed **Qwen3.5-4B Q4_K_M** file, use the native inspection bridge:
+Use Python 3.11+ and [uv](https://docs.astral.sh/uv/). From the repository root:
 
 ```bash
-python scripts/build_gguf_bridge.py  # C++ compiler + the installed llama.cpp b11669 runtime
-qwen-lab stop
-synapse stop
-synapse start --model /absolute/path/to/Qwen3.5-4B-Q4_K_M.gguf
+uv sync
+uv run python scripts/synapse.py serve --model HuggingFaceTB/SmolLM2-135M-Instruct
 ```
 
-The bridge reads the GGUF's own tokenizer, quantized weights and live `ffn_swiglu`
-tensors. It supports per-token activations, add/multiply interventions, paired
-greedy generation, an on-demand logit lens, and upstream/downstream connection
-links. Weights stay quantized and unchanged
-on disk. Qwen3.5 is the currently validated GGUF graph; other GGUF architectures
-are rejected explicitly. The model name remains visible above the map. Editing
-the launch-command preview does not switch the running server's checkpoint.
+Open **http://127.0.0.1:8791** in a WebGL2-capable browser. The server starts
+without loading model weights. Use **synapse → Load model for live experiments**
+or request an activation/steering probe to load them. The first use may download
+the checkpoint; allow disk space and RAM. The default dependency configuration
+uses CPU PyTorch.
 
-For bounded residual-vector capture and reversible rank-one weight corrections,
-see [the residual projection research path](docs/RESIDUAL_PROJECTION.md).
-It uses separate, checkpoint-bound factor archives and leaves the GGUF unchanged.
-A rebuild and service restart are required; infrastructure validation and a
-useful refusal direction are separate research results.
+To use the Agent tab, separately install and authenticate Codex CLI or Claude
+Code, then choose that provider in the UI. Synapse connects its MCP tools
+automatically. Agent conversations use the provider's configured model; they do
+not turn the inspected local model into the coding agent.
 
-Select a neuron to compute its strongest links across the other layers. The map
-draws the first five links each way by default; Details lists 24 with token labels.
-Click a neighbor to follow it, or choose **2 hops** / **3 hops** to expand the web.
-Scores and labels are cached per checkpoint, so returning to a neighborhood is fast.
-Each expansion request is bounded to 12 source neurons and reports any truncation.
-Hovering uses cached links and does not queue a new whole-network calculation.
-GGUF selection works before inference is loaded: a vocabulary-only loader and
-read-only mapping stream bounded weight chunks for links and token labels.
-Hover reads only existing links and labels; select a neuron to compute missing
-data. Changing selection clears old results and cancels its requests. A scan
-already running may finish into the cache; disconnected requests waiting to
-start are skipped.
+See [Operations](docs/OPERATIONS.md) for model selection, the optional Linux user
+service, GGUF setup, agent configuration and verification. These commands use the
+repository launcher; `uv sync` does **not** install a global `synapse` command.
 
-The connection score matches the original gated-MLP direct-path method:
-`g = gate_reader · (norm_gain_reader * down_writer)` and likewise `u` for the up
-projection; rank `abs(g*u)` by its z-score within each compared layer. GGUF norm
-gains already contain Qwen's conversion offset. The method uses the quantized
-file's weights, without substituting the author's BF16 index. On-demand web token
-summaries use weighted counts over the shown neighbors; layerwise token-frequency
-lift requires a whole-model index. These links describe weight alignment.
+## Model support
 
-This CPU backend uses a 2,048-token context and generates the three steering rows
-sequentially. Loading inference needs at least 4.25 GiB available RAM after Python starts
-(more for larger files), based on the measured 3.7 GiB full-process connection/lens check.
-Synapse and `qwen-lab` share a process lock so they cannot load two Qwen contexts
-at once. Stop Synapse before returning to `qwen-lab chat`. Calibration, neuron
-names and caches belong to the quantized file; the author's BF16 data is separate.
+| Path | Scope |
+| --- | --- |
+| Hugging Face Transformers | Structural adapters for supported dense decoder layouts, including Llama, Mistral, Qwen2/3/3.5, Gemma2, GPT-2, GPT-NeoX, OPT and Phi3. Small architecture tests cover capture and interventions; available lens, connection and head operations depend on the adapter. |
+| Native GGUF, CPU | Qwen3.5 with pinned llama.cpp b11669; inspection and neuron steering have been exercised on Qwen3.5-4B Q4_K_M. Other GGUF architectures, GGUF head ablation and a whole-model GGUF lens index are not implemented. |
+| Bundled author map | Lyra's precomputed Qwen exhibit, viewable without loading weights. It is kept separate from live checkpoints. |
 
-For Lyra's shipped Qwen visualization without weights:
+Compatibility is checked from structure and dimensions, not just the model name.
+MoE, encoder-decoder and unsupported packed/quantized Transformers projections
+need additional adapters. Consult the running server's `overview` MCP tool or
+`/api/agent/overview` before choosing a probe.
 
-```bash
-synapse start --author-map
-```
+## Experimental research API
 
-That bundle is an author-provided exhibit. Its calibration and indexes are never
-used for live inference or another checkpoint. Generated data, names and calibration
-are stored separately by checkpoint/revision under `.synapse/models/`.
+The [residual projection API](docs/RESIDUAL_PROJECTION.md) implements bounded
+residual capture, request-scoped projection interventions and export of
+checkpoint-bound factor archives. This is an experimental Qwen3.5 research path:
+live integration validation is still pending. Factor archives are Synapse callback
+adapters, not merged GGUF files or standard llama.cpp LoRAs.
 
-## Work with Codex
+See the [research agenda](docs/RESEARCH_AGENDA.md) for experiment design, controls
+and evaluation.
 
-Install and authenticate [Codex CLI](https://learn.chatgpt.com/docs/non-interactive-mode)
-once. Open the **Agent** tab and choose **Codex CLI**. The optional model field
-selects the agent model; it is separate from the local checkpoint being examined.
-The CLI default is used when blank. Claude Code remains available when installed.
+## Foundations and credit
 
-Codex gets the explorer's MCP tools, the selected-neuron context, and this workspace.
-It can inspect activations, run paired interventions, select/highlight neurons,
-and write experiment scripts and notes. Tool calls and results appear in the panel.
-Sessions resume across browser/server restarts; a new provider, agent model or
-checkpoint gets separate conversation state. Codex edit/reroll is intentionally
-not exposed as destructive session-file surgery; use **new** for a fresh thread.
+Synapse builds on [Lyra's neuron-explorer](https://github.com/lyramakesmusic/neuron-explorer):
+the map, lens, activation/steering interface and Claude-assisted exploration form
+its foundation. Synapse extends that workspace with Codex integration, checkpoint
+selection and dense adapters, isolated model state, native quantized-weight
+inspection and the experimental residual research API.
 
-The bridge invokes `codex exec --json`, keeps authentication in the existing CLI,
-and uses a workspace-write sandbox. Other globally configured MCP servers are
-disabled for that invocation. The known Synapse research/UI tools are explicitly allowed; shell access remains workspace-scoped. It does not copy credentials into the repository.
-`.codex/config.toml` also makes the MCP available when this project is trusted;
-`synapse codex` supplies its absolute path explicitly.
-
-A newly opened agent thread reads the saved project context. It does not inherit
-some other chat's complete conversation or become that already-running session.
-
-## Compatibility
-
-The adapters inspect module structure, projection orientation and dimensions.
-Unsupported shapes produce an explicit error. A model-family name alone is not
-proof that every variant, quantizer or operation works.
-
-| Backend / architecture | Current scope |
-|---|---|
-| Dense Transformers: Llama, Mistral, Qwen2/3, Qwen3.5 hybrid, Gemma2, GPT-2, GPT-NeoX, OPT, Phi3 layouts | Activation capture, add/multiply interventions, three-way generation; small actual architecture tests |
-| Final norm + unembedding | Logit lens when the adapter exposes both |
-| Separate gate/up MLP + supported pre-MLP RMSNorm | Direct-path weight heuristic; explicitly reported as a heuristic |
-| Compatible new dense variants | Structural detection, then runtime validation; not a blanket guarantee |
-| Transformers MoE, encoder-decoder, nonuniform MLP widths, packed/quantized projections | Need additional adapters/backends; rejected explicitly |
-| Qwen3.5 GGUF / pinned llama.cpp b11669 CPU | Live activations, steering, per-neuron lens, cached upstream/downstream connections and bounded multi-hop webs; validated on the installed 4B Q4_K_M file |
-| Other GGUF architectures; GGUF head ablation and whole-model lens indexing | Not yet implemented; capability reporting makes this explicit |
-| Closed API models | Can be research agents; weights and internal neurons are not available |
-
-The hook coordinate is the input to the MLP output projection, after gating or
-activation. Additive doses scale the projection output by a reference residual
-norm. Post-MLP normalization can alter the eventual residual effect. Heads are
-exposed only when their projection layout is validated. See `/api/agent/overview`.
-
-Indexes for a new checkpoint are optional and are never borrowed from Qwen:
-
-```bash
-synapse stop
-synapse index --scale --lens    # explicit work; can be costly for large vocabularies
-synapse start
-```
-
-First-use activation calibration uses a short fixed reference text, clearly
-labelled as such. It is not a corpus percentile. Full activation capture is bounded;
-longer text is limited to the token budget returned by the server. Connection and layout builders now use the selected adapter and checkpoint cache; connection scoring requires a supported gated MLP. UMAP layouts require `uv sync --extra analysis`. Upstream vLLM GPU sweep scripts remain Qwen research utilities, not universal pipelines.
-
-## Research and verification
-
-Read [the research agenda](docs/RESEARCH_AGENDA.md) for experiments, controls and
-what would count as evidence of untapped capability. Style changes, neuron labels
-and colorful graphs do not demonstrate increased intelligence, solved
-interpretability or recursive self-improvement.
-
-```bash
-EXPLORER_NO_MODEL=1 EXPLORER_BUNDLED_CACHE=1 .venv/bin/python -m pytest -q tests
-```
-
-Tests construct small real Transformers architectures without downloading weights.
-They check unchanged baseline outputs, the additive column equation, whole-MLP
-ablation, zero-dose continuation equivalence, cleanup and checkpoint isolation.
-They establish implementation behavior, not capability improvement in trained models.
-Machine-specific receipts and smoke outputs live locally under `evidence/`.
-
-`scripts/verify_gguf_native.py` is an explicit real-checkpoint test for the installed
-Qwen file. Run it with Synapse and `qwen-lab` stopped, under a memory limit. It
-compares plain llama.cpp against observation and zero-dose callbacks, checks state
-reset and nonzero effects, and checks capture across multiple processing batches.
-The native bridge uses headers pinned by commit and SHA256, not arbitrary system
-headers. See [the callback implementation](https://github.com/ggml-org/llama.cpp/blob/620d2225c/ggml/src/ggml-backend.cpp)
-and [Qwen's graph](https://github.com/ggml-org/llama.cpp/blob/620d2225c/src/models/qwen35.cpp).
-
-`scripts/verify_gguf_connections.py` checks the native connection dot products
-against independent NumPy matrix products, checks the same writer/reader pair
-from both directions, checks unchanged logits, and compares batched/scalar lens
-labels. Run it with the model services stopped. With Synapse running,
-`scripts/verify_connection_view.py` checks link lists, caching, binary map edges,
-two-hop expansion, summaries and the agent cone endpoint. Use the project Python.
-
-`scripts/verify_gguf_inspection.py` uses a new isolated cache, forbids inference,
-and checks early/middle/final-layer selections, lens agreement, the model hash,
-and process peak RSS. Its optional `--reference <inspection-run-directory>`
-compares the same vectors/lens with the inference path and checks unchanged
-baseline logits, behind the normal inference admission check. Run that mode
-with model services stopped and under the service memory bound. These are
-bounded implementation checks, not a capability experiment.
-
-Park's Qwen3.5-4B Q4_K_M and OpenCode installation remains available through
-`qwen-lab chat`; its server has a separate 5 GiB available-RAM gate. The detailed
-initial investigation is saved locally in `PLAYBOOK.md`, with setup decisions in
-`DECISIONS.md`. Model files, chat histories and those machine records are ignored
-by Git.
-
-## Provenance
-
-Upstream revision: `f79b2196e29aacbad89684938baac8d97b172fd1`.
-The [original README](docs/UPSTREAM_README.md), research notes and author caches
-are retained. No LICENSE file was present in the inspected upstream revision;
-this fork does not assign a new license to the author's code or data.
+The [upstream README](docs/UPSTREAM_README.md) is preserved from revision
+`f79b2196e29aacbad89684938baac8d97b172fd1`. No license file was present in that
+snapshot; this fork does not assign a license to the upstream code or data.

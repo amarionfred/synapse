@@ -1,6 +1,7 @@
 # Synapse
 
-This is Park's neuron exploration workspace, forked from Lyra's neuron-explorer.
+This is Amarion's neuron exploration workspace, forked from Lyra's neuron-explorer.
+The user's name is Amarion; `park` is only the existing system username/path.
 Use the Synapse MCP `overview` tool before interpreting any neuron. The checkpoint,
 revision, supported operations, calibration and loaded status come from the server.
 Never apply Qwen's bundled data or neuron numbers to a different checkpoint.

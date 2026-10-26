@@ -20,11 +20,15 @@ alone is a different operation, especially at partial strengths.
 
 ## Build and validate
 
-Build with `python scripts/build_gguf_bridge.py`. Restart Synapse from a separate
-terminal; restarting from an agent hosted inside its service ends that session:
+Build from the checkout with `uv run python scripts/build_gguf_bridge.py`.
+If using the optional Linux user service, restart it from a separate terminal;
+restarting from an agent hosted inside that service ends its session:
 
-    synapse stop
-    synapse start
+    uv run python scripts/synapse.py stop
+    uv run python scripts/synapse.py start
+
+For a foreground server, stop its `serve` process with Ctrl-C and rerun the
+original launch command. See [Operations](OPERATIONS.md) for both launch modes.
 
 Then, with the same checkpoint selected and ordinary memory admission intact:
 
