@@ -8,12 +8,13 @@ import json
 import os
 import sqlite3
 import threading
+import uuid
 
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from adapters import DenseAdapter, UnsupportedArchitecture
-from model_config import MODEL, REVISION, NO_MODEL, CACHE, ARCH, IDENTITY
+from model_config import MODEL, REVISION, NO_MODEL, CACHE, ARCH, IDENTITY, MODEL_KEY
 
 REFERENCE_TEXT = (
     "The history of the region is long and varied. Farmers settled the river valley first, then traders arrived, "
@@ -49,6 +50,8 @@ class Runtime:
         self._handles = []
         self.adapter = None
         self._batch_shapes = {}
+        self._research_hook = None
+        self._research_checkpoint = None
 
     # ---------- loading ----------
     def ensure_loaded(self):
@@ -82,18 +85,23 @@ class Runtime:
                 dtype = "auto" if dtype_name == "auto" else getattr(torch, dtype_name)
                 m = loader.from_pretrained(MODEL, revision=IDENTITY["revision"], trust_remote_code=False,
                                            dtype=dtype).to(dev).eval()
-                self.attach(m, tok, dev)
+                self.attach(m, tok, dev, identity={"model_key": MODEL_KEY, "identity": IDENTITY})
             except Exception as e:
                 self.status = f"error: {e}"
                 raise
 
-    def attach(self, model, tokenizer, device="cpu"):
+    def attach(self, model, tokenizer, device="cpu", identity=None):
         """Validate before installing any hook; also used by small architecture verification models."""
         adapter = DenseAdapter(model)
         for handle in self._handles:
             handle.remove()
         self._handles = []
         self.dev, self.model, self.tok, self.adapter = device, model, tokenizer, adapter
+        self.resid_p50.clear()
+        self._research_clear()
+        # An arbitrary attached model must not inherit the configured checkpoint.
+        self._research_checkpoint = identity or {"model_key": "attached-" + uuid.uuid4().hex,
+                                                "identity": {"source": "in-memory attachment", "verified_weights": False}}
         self.lm = adapter.base
         for i, layer in enumerate(adapter.layers):
             self._handles.append(layer.register_forward_pre_hook(self._shape_hook(i), with_kwargs=True))
@@ -105,8 +113,12 @@ class Runtime:
         self.status = "ready"
 
     def capabilities(self):
-        return self.adapter.describe() if self.adapter else {"adapter": "not loaded", "capabilities": {},
+        caps = self.adapter.describe() if self.adapter else {"adapter": "not loaded", "capabilities": {},
                   "note": "Module shapes are validated on load; a model ID alone does not prove compatibility."}
+        return {**caps, "context_tokens": self._research_context_limit(),
+                "inference_loaded": self.model is not None,
+                "research_execution": {"implementation_available": True, "validated": False,
+                                       "scope": "single-arm, complete scoring, selected MLP capture/edit"}}
 
     def validate_coordinate(self, layer, n=None):
         if self.adapter:
@@ -139,6 +151,33 @@ class Runtime:
             if self._read is not None and self._read[0] == i:
                 n = self._read[1]
                 self._seen["act"] = h[0, :, n].float().cpu()
+            if self._research_hook is not None:
+                pushes, edits, capture, values = self._research_hook
+                # Research uses one unpadded full-prefix row and use_cache=False.
+                for index, (layer, position, neuron) in enumerate(capture):
+                    if layer == i:
+                        if index in values:
+                            raise ValueError("Selected capture callback executed twice")
+                        values[index] = float(h[0, position, neuron])
+                mine = [p for p in pushes if p[0] == i]
+                selected = [p for p in edits if p[0] == i]
+                if mine or selected:
+                    h = h.clone()
+                    for _, neuron, mode, value in mine:
+                        if neuron is None:
+                            h *= value
+                        elif mode == "mul":
+                            h[:, :, neuron] *= value
+                        else:
+                            h[:, :, neuron] += value
+                    for _, neuron, mode, value, position in selected:
+                        if mode == "set":
+                            h[:, position, neuron] = value
+                        elif mode == "mul":
+                            h[:, position, neuron] *= value
+                        else:
+                            h[:, position, neuron] += value
+                    return (h.reshape(original_shape), *inp[1:])
             mine = [p for p in self._push if p[0] == i] if self._push else []
             if mine:
                 h = h.clone()
@@ -191,7 +230,7 @@ class Runtime:
         if os.path.exists(path):
             v = float(np.load(path)["resid_norm_q10_50_90"][1])
         else:
-            ids = self.tok(REFERENCE_TEXT, return_tensors="pt").input_ids.to(self.dev)
+            ids = self.tok(REFERENCE_TEXT, return_tensors="pt").input_ids[:, :128].to(self.dev)
             self._seen["want_resid"] = layer
             try:
                 with torch.inference_mode():
@@ -216,6 +255,146 @@ class Runtime:
             return self.tok(text, add_special_tokens=True).input_ids
         enc = self.tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False, tokenize=True)
         return list(enc["input_ids"] if hasattr(enc, "keys") else enc)
+
+    def research_identity(self):
+        return {"checkpoint": self._research_checkpoint or {"model_key": MODEL_KEY, "identity": IDENTITY},
+                "runtime": {"backend": "transformers", "implementation": "research-v1"},
+                "calibration": {"activation": self.calibration_info(),
+                                "residual_norms": {str(k): v for k, v in sorted(self.resid_p50.items())}}}
+
+    def _research_render(self, text, chat):
+        if type(chat) is not bool:
+            raise ValueError("chat must be boolean")
+        if not chat:
+            return text, True
+        messages = [{"role": "user", "content": text}]
+        if not self.tok.chat_template:
+            return f"user: {text}\nassistant:", True
+        return self.tok.apply_chat_template(messages, add_generation_prompt=True,
+                                           enable_thinking=False, tokenize=False), False
+
+    def _research_context_limit(self):
+        if self.model is None:
+            return 2048
+        config = self.model.config
+        config = config.get_text_config() if hasattr(config, "get_text_config") else config
+        return min(2048, int(getattr(config, "max_position_embeddings", getattr(config, "n_positions", 2048))))
+
+    def _research_normalize(self, pushes):
+        out, occupied = [], set()
+        for item in pushes:
+            if not isinstance(item, (list, tuple)) or len(item) != 4:
+                raise ValueError("Pushes are [layer, neuron, dose, mode]")
+            layer, neuron, dose, mode = item
+            if type(layer) is not int or (neuron is not None and type(neuron) is not int):
+                raise ValueError("Intervention coordinates must be integers")
+            self.validate_coordinate(layer, neuron)
+            if not isinstance(mode, str) or mode not in {"add", "mul"} or type(dose) not in (int, float) or not np.isfinite(dose) or abs(dose) > 100:
+                raise ValueError("Research doses must be finite with magnitude <=100; mode add or mul")
+            if neuron is None and mode != "mul":
+                raise ValueError("Whole-layer intervention must multiply")
+            if (layer, neuron) in occupied or (layer, None) in occupied or (neuron is None and any(p[0] == layer for p in occupied)):
+                raise ValueError("Conflicting intervention coordinates")
+            occupied.add((layer, neuron))
+            if mode == "mul" or dose == 0:
+                value = float(dose)
+            else:
+                if mode == "add" and dose != 0 and layer not in self.resid_p50:
+                    raise ValueError("Additive research requires explicit calibration first; use /api/research/calibrate")
+                entry = self._push_entry(layer, neuron, dose, mode, (1,))
+                value = float(entry[3][0])
+            if not np.isfinite(np.float32(value)):
+                raise ValueError("Intervention exceeds float32 range")
+            out.append((layer, neuron, mode, value))
+        return out
+
+    def _research_input(self, full_ids, reset):
+        # No recurrent/KV state is retained on the dense backend. Each prefix
+        # is recomputed with the same scoped configuration on every token.
+        return full_ids, 0
+
+    def _research_eval(self, ids, *, reset, pushes, edits, capture, position_offset=0):
+        values = {}
+        self._research_hook = (pushes, edits, capture, values)
+        try:
+            with torch.inference_mode():
+                output = self.adapter.logits(input_ids=torch.tensor([ids], device=self.dev), use_cache=False)
+            if len(values) != len(capture):
+                raise ValueError("Selected capture callback missing")
+            return output.logits[0, -1].float().cpu().numpy(), [values[i] for i in range(len(capture))]
+        finally:
+            self._research_hook = None
+
+    def _research_clear(self):
+        self._research_hook = self._push = self._heads = None
+        self._batch_shapes.clear()
+
+    def _research_eos(self):
+        value = getattr(self.tok, "eos_token_id", None)
+        return int(value) if value is not None else None
+
+    def _research_is_eog(self, token):
+        value = getattr(getattr(self.model, "generation_config", None), "eos_token_id", None)
+        if value is None:
+            value = self._research_eos()
+        return token in (value if isinstance(value, list) else [value])
+
+    def score_sequence(self, text, completion, chat=True, prefix="", pushes=None,
+                       eos_policy="exclude", cancel=None, deadline=None, **scopes):
+        from answer_scoring import score_sequence
+        return score_sequence(self, text, completion, chat, prefix, pushes,
+                              eos_policy, cancel, deadline, **scopes)
+
+    def generate_one(self, messages, pushes=None, max_new=32, cancel=None, deadline=None, **scopes):
+        from answer_scoring import generate_one
+        return generate_one(self, messages, pushes, max_new, cancel, deadline, **scopes)
+
+    def capture_selected(self, text, selection, chat=True, prefix="", pushes=None, cancel=None, deadline=None):
+        from answer_scoring import capture_selected
+        return capture_selected(self, text, selection, chat, prefix, pushes, cancel, deadline)
+
+    def research_token_bound(self, operation, **request):
+        # No model load. Calibration is explicit, so it cannot escape a measured
+        # request's budget. Dense decoding recomputes the full prefix each step.
+        limit = self._research_context_limit()
+        if operation == "generate":
+            return limit * request["max_new"]
+        return limit * min(1024, limit)
+
+    def calibrate_research(self, layers, cancel=None, deadline=None):
+        """Explicit fixed-reference normalization, before freezing jobs/presets."""
+        import time
+        from answer_scoring import interrupted
+        if (not isinstance(layers, list) or not 1 <= len(layers) <= 32
+                or any(type(layer) is not int for layer in layers) or len(set(layers)) != len(layers)):
+            raise ValueError("Calibration requires 1..32 distinct integer layers")
+        for layer in layers:
+            if type(layer) is not int:
+                raise ValueError("Calibration layers must be integers")
+            self.validate_coordinate(layer)
+        started = time.monotonic()
+        counts = {"forward_passes": 0, "evaluated_tokens": 0}
+        with self.lock:
+            reason = interrupted(cancel, deadline)
+            if reason:
+                return {"completed": False, "finish_reason": reason, "counts": counts}
+            self.ensure_loaded()
+            try:
+                for layer in layers:
+                    reason = interrupted(cancel, deadline)
+                    if reason:
+                        break
+                    if layer not in self.resid_p50:
+                        tokens = len(self.tok(REFERENCE_TEXT).input_ids[:128])
+                        counts["forward_passes"] += 1
+                        counts["evaluated_tokens"] += tokens
+                        self.layer_resid_p50(layer)
+                reason = interrupted(cancel, deadline)
+            finally:
+                self._research_clear()
+            counts["wall_seconds"] = time.monotonic() - started
+            return {"completed": reason is None, "finish_reason": reason or "completed",
+                    "identity": self.research_identity(), "counts": counts}
 
     def steer_stream(self, layer, n, rows_messages, dose, mode, max_new=200, cancel=None):
         """Greedy-decodes three conversations in one batch: row 0 pushed up, row 1 unsteered, row 2 pushed down.

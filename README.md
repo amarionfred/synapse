@@ -31,6 +31,11 @@ with selected-neuron token labels and connection links visible.*
 - **Keep results tied to the model.** Checkpoint/revision identity separates caches,
   calibration and neuron names. The server reports supported operations and loaded
   state; the agent model is separate from the checkpoint under investigation.
+- **Run bounded research.** The Research view adds complete-answer scoring,
+  single-arm generation, durable paired jobs, fixed-menu local researcher
+  episodes and immutable intervention presets. Selected MLP captures and
+  token-position edits are available through HTTP/MCP. These tools retain the
+  shared runtime and memory guard; full-checkpoint research validation is pending.
 - **Explore residual interventions (experimental).** The research API implements
   selected-layer residual capture, reversible projections and factor-archive
   exports. See the [API and live-validation status](docs/RESIDUAL_PROJECTION.md).
@@ -73,6 +78,23 @@ need additional adapters. Consult the running server's `overview` MCP tool or
 `/api/agent/overview` before choosing a probe.
 
 ## Experimental research API
+
+`GET /api/research/overview` reports the selected checkpoint, available research
+operations, request limits and live-validation status without loading inference.
+The research API keeps the inspected local model separate from the Agent tab's
+external Codex/Claude provider.
+
+`POST /api/research/score` scores one complete answer in prompt context;
+`POST /api/research/generate` requests one greedy generation arm. Their runtime
+availability is reported by the research overview. Both retain the existing
+model admission and shared lease, serialize execution, and pass cancellation and
+deadlines through to the worker. See [request examples and scoring policy](docs/OPERATIONS.md#bounded-research-requests).
+Paired jobs, preset ancestry and measured local researcher episodes use one
+compact SQLite store. See [jobs, presets and researcher examples](docs/OPERATIONS.md#paired-jobs-presets-and-the-local-researcher)
+and [selected capture/scoped edits](docs/OPERATIONS.md#selected-activation-capture-and-scoped-edits).
+Additive research requires explicit calibration before freezing its identity.
+The legacy `logprobs` tool still reports next-token probabilities and marks
+multi-token targets as `first_token_only`.
 
 The [residual projection API](docs/RESIDUAL_PROJECTION.md) implements bounded
 residual capture, request-scoped projection interventions and export of

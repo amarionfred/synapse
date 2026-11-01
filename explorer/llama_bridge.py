@@ -22,6 +22,14 @@ class Push(C.Structure):
     ]
 
 
+class ScopedPush(C.Structure):
+    _fields_ = Push._fields_ + [("position", C.c_int)]
+
+
+class Selected(C.Structure):
+    _fields_ = [("layer", C.c_int), ("position", C.c_int), ("neuron", C.c_int)]
+
+
 def ptr(a, dtype=F32):
     return None if a is None else a.ctypes.data_as(dtype)
 
@@ -73,6 +81,15 @@ class Bridge:
         for name, (ret, args) in signatures.items():
             f = getattr(self.lib, "syn_" + name)
             f.restype, f.argtypes = ret, args
+        for name, args in {
+            "clear": [C.c_void_p], "eos": [C.c_void_p],
+            "eval_scoped": [C.c_void_p, I32, C.c_int, C.c_bool, C.c_int,
+                            C.POINTER(Push), C.c_int, C.POINTER(ScopedPush), C.c_int,
+                            C.POINTER(Selected), C.c_int, F32, F32],
+        }.items():
+            if hasattr(self.lib, "syn_" + name):
+                f = getattr(self.lib, "syn_" + name)
+                f.restype, f.argtypes = C.c_int, args
         if hasattr(self.lib, "syn_research"):
             self.lib.syn_research.restype = C.c_int
             self.lib.syn_research.argtypes = [
@@ -197,6 +214,45 @@ class Bridge:
             )
         )
         return logits, acts, resid
+
+    @property
+    def eos_token_id(self):
+        if not hasattr(self.lib, "syn_eos"):
+            raise RuntimeError("EOS scoring requires a rebuilt GGUF bridge and server restart")
+        token = self.lib.syn_eos(self.handle)
+        return token if token >= 0 else None
+
+    def clear(self):
+        """Clear both recurrent/KV memory and all request-owned native pointers."""
+        if not hasattr(self.lib, "syn_clear"):
+            raise RuntimeError("Research cleanup requires a rebuilt bridge and server restart")
+        self.check(self.lib.syn_clear(self.handle))
+
+    def run_scoped(self, ids, *, reset=True, pushes=(), edits=(), capture=(), position_offset=0):
+        if not hasattr(self.lib, "syn_eval_scoped"):
+            raise RuntimeError("Scoped research requires a rebuilt bridge and server restart")
+        ids = np.ascontiguousarray(ids, dtype=np.int32)
+        if ids.ndim != 1 or not 1 <= len(ids) <= 2048:
+            raise ValueError("Scoped research requires 1..2048 tokens")
+        if len(pushes) > 128 or len(edits) > 4096 or len(capture) > 4096:
+            raise ValueError("Scoped request exceeds bounded intervention/capture counts")
+        if type(position_offset) is not int or not 0 <= position_offset <= 2048 - len(ids):
+            raise ValueError("Invalid scoped position offset")
+        modes = {"add": 0, "mul": 1, "set": 2}
+        ps = (Push * len(pushes))(*(
+            Push(l, -1 if n is None else n, modes[mode], v) for l, n, mode, v in pushes))
+        es = (ScopedPush * len(edits))(*(
+            ScopedPush(l, -1 if n is None else n, modes[mode], v, position)
+            for l, n, mode, v, position in edits))
+        selected = (Selected * len(capture))(*(Selected(*row) for row in capture))
+        values = np.empty(len(capture), np.float32)
+        logits = np.empty(self.vocab, np.float32)
+        self.check(self.lib.syn_eval_scoped(
+            self.handle, ptr(ids, I32), len(ids), reset, position_offset,
+            ps, len(ps), es, len(es), selected, len(selected), ptr(values), ptr(logits)))
+        if not np.isfinite(values).all() or not np.isfinite(logits).all():
+            raise ValueError("Nonfinite native research output")
+        return logits, values.tolist()
 
     def column(self, l, n):
         out = np.empty(self.arch["hidden"], np.float32)

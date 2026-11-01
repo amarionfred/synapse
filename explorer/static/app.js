@@ -1,4 +1,4 @@
-import { createMap } from "./map3d.js?v=69";
+import { createMap } from "./map3d.js?v=70";
 import { createScatter } from "./scatter.js?v=39";
 
 const $ = s => document.querySelector(s);
@@ -13,6 +13,7 @@ const fmtDose = d => (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(d);
 
 let agentSelecting = false, agentMarked = false;  // Claude's selections and marks (see agentUi); declared early, openNeuron reads them on load
 const state = { layer: null, units: {}, unitMap: {}, focus: null, view: "map", chat: { mode: "add", dir: "writes", dose: { add: 0.8, mul: 2 } } };
+const research = { overview: null, probe: null, ctl: null, busy: false, refreshing: false, refreshVersion: 0, presets: [], pollTimer: null };
 const ADD_STEPS = [...Array.from({ length: 30 }, (_, i) => +((i + 1) * 0.05).toFixed(2)), 1.75, 2, 2.5, 3, 4, 5];
 const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12, 16];
 
@@ -212,7 +213,12 @@ function setView(v) {
   document.querySelectorAll("#views button").forEach(x => x.classList.toggle("on", x.dataset.view === v));
   $("#map-view").classList.toggle("on", v === "map");
   $("#embed-view").classList.toggle("on", v === "embed");
+  $("#research-view").classList.toggle("on", v === "research");
+  document.body.classList.toggle("research-open", v === "research");
+  hideTip();
   if (v === "embed") loadEmbeddings();
+  if (v === "research") refreshResearch();
+  updateInsets();
 }
 const layerSel = $("#layer");
 for (let l = 0; l < arch.n_layers; l++) {
@@ -514,6 +520,8 @@ function setTab(t) {
   focusEl.classList.toggle("on-claude", t === "claude");
   tabBtn(t).classList.remove("fresh");
   if (t === "claude") { const th = $("#a-thread"); th.scrollTop = th.scrollHeight; }
+  if (t === "details" && state.focus?.kind === "neuron" && selectionController)
+    loadConnectionLabels(state.focus.layer, state.focus.n, selectionController);
 }
 // a tab that changed while another was showing gets a dot until opened
 function markFresh(t) { if (curTab() !== t) tabBtn(t).classList.add("fresh"); }
@@ -533,6 +541,7 @@ function clearSelection() {
   selectionController?.abort(); selectionController = null;
   webController?.abort(); webController = null; webKey = null;
   state.con = state.lens = state.webSum = null;
+  setConnectionStatus("");
   map.select(null); scatter.select(null, null);
   map.setConnections({up: [], down: []}); map.setWeb(null); hideTip();
 }
@@ -544,6 +553,7 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   const ctl = new AbortController(); selectionController = ctl;
   const current = () => selectionController === ctl && !ctl.signal.aborted;
   state.focus = { layer, n, kind };
+  if (kind === "neuron") setConnectionStatus(`Loading links · L${layer} N${n}`);
   if (map.layerMode !== null && map.layerMode !== layer) map.enterLayer(layer);
   if (push && kind === "neuron") history.replaceState(null, "", `#L${layer}/N${n}`);
   focusEl.classList.add("on"); $("#list").classList.add("has-focus");
@@ -562,6 +572,7 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   setNameField(state.unitMap[layer]?.get(n)?.name || "");
   renderList();
   if (kind === "neuron") { map.select(layer, n, fly); scatter.select(layer, n); }
+  const connectionsReady = kind === "neuron" ? loadConnections(layer, n, ctl) : null;
   refreshWeb(); renderAgentActions();
   const u = await api(`/api/unit?layer=${layer}&n=${n}&kind=${kind}`, null, ctl.signal);
   if (!current()) return;
@@ -569,10 +580,11 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   if (u.stats) $("#f-rank").textContent = `#${u.rank ?? "—"}/${u.n_ranked}  mass ${(u.stats.mass ?? u.stats.z).toFixed(1)}  null ${(u.stats.null_pct * 100).toFixed(0)}%`;
   renderExamples(u);
   renderDetails(u);
+  renderConnections();
   const hasRollouts = !!(u.rollouts && u.rollouts.length);
   document.querySelector('#tabs button[data-tab="examples"]').style.display = hasRollouts ? "" : "none";
   if (!hasRollouts && document.querySelector("#tabs button.on")?.dataset.tab === "examples") setTab("details");
-  if (kind === "neuron") loadLive(layer, n, ctl);
+  if (kind === "neuron") loadLive(layer, n, ctl, connectionsReady);
   } catch (err) { if (current()) $("#tab-details").textContent = err.message; }
 }
 
@@ -618,15 +630,42 @@ function renderDetails(u) {
   $("#tab-details").innerHTML = h;
 }
 
-async function loadLive(layer, n, ctl) {
+async function loadConnections(layer, n, ctl) {
+  const current = () => selectionController === ctl && !ctl.signal.aborted;
+  try {
+    // Drawing links must never wait for dozens of neighbor token labels.
+    const con = await api(`/api/connections?layer=${layer}&n=${n}&k=24&lens=0`, null, ctl.signal);
+    if (!current()) return null;
+    map.setConnections(con); state.con = con; renderConnections();
+    setConnectionStatus(`${con.up.length + con.down.length} links · L${layer} N${n}`);
+    if (curTab() === "details") loadConnectionLabels(layer, n, ctl);
+    return con;
+  } catch (err) {
+    if (current()) {
+      setConnectionStatus(`Links unavailable · L${layer} N${n}`);
+      const el = $("#d-con"); if (el) el.textContent = err.message;
+    }
+    return null;
+  }
+}
+
+async function loadConnectionLabels(layer, n, ctl) {
+  if (!state.con || ctl.connectionLabelsStarted || selectionController !== ctl || ctl.signal.aborted) return;
+  ctl.connectionLabelsStarted = true;
+  try {
+    const con = await api(`/api/connections?layer=${layer}&n=${n}&k=24`, null, ctl.signal);
+    if (selectionController !== ctl || ctl.signal.aborted) return;
+    state.con = con; renderConnections();
+  } catch (err) {
+    if (selectionController === ctl && !ctl.signal.aborted) ctl.connectionLabelsStarted = false;
+  }
+}
+
+async function loadLive(layer, n, ctl, connectionsReady) {
   const current = () => selectionController === ctl && !ctl.signal.aborted;
   $("#d-lens") && ($("#d-lens").textContent = "…");
-  $("#d-con") && ($("#d-con").textContent = "…");
-  const conP = api(`/api/connections?layer=${layer}&n=${n}&k=24`, null, ctl.signal);
-  conP.then(con => {
-    if (!current()) return;
-    map.setConnections(con); state.con = con; renderConnections();
-  }, err => { if (current() && $("#d-con")) $("#d-con").textContent = err.message; });
+  // Finish the geometry request before scheduling further weight reads.
+  if (!await connectionsReady || !current()) return;
   let lens;
   try { lens = await api(`/api/lens?layer=${layer}&n=${n}`, null, ctl.signal); }
   catch (err) { if (current() && $("#d-lens")) $("#d-lens").textContent = err.message; }
@@ -799,6 +838,12 @@ async function runReads(f, text) {
 }
 
 // ---------- status ----------
+function renderStatus() {
+  $("#status").textContent = state.connectionStatus || (state.statusText === "ready" ? "" : state.statusText || "");
+}
+function setConnectionStatus(message) {
+  state.connectionStatus = message; renderStatus();
+}
 // keeps polling (slowly once ready), so a server restart or a one-off error message clears itself
 async function pollStatus() {
   try {
@@ -808,7 +853,7 @@ async function pollStatus() {
       return;
     }
     state.statusText = s.status;
-    $("#status").textContent = s.status === "ready" ? "" : s.status;
+    renderStatus();
     if (s.status === "ready" && lensResults && !lensResults.ready) runLensSearch();
     setTimeout(pollStatus, s.status === "ready" ? 8000 : 2000);
   } catch {
@@ -825,6 +870,431 @@ let saved = null; try { const v = localStorage.getItem("ne.layer"); if (v !== nu
 const first = have.includes(saved) ? saved : have.includes(22) ? 22 : (have[0] ?? 0);
 await setLayer(first);
 if (location.hash) fromHash();
+
+// ---------- local research ----------
+// Public v1 contract: overview is read-only; score/generate each execute one arm.
+// All measured calls share the inspected runtime. Never substitute legacy next-token scores.
+async function researchRequest(path, body, signal) {
+  const response = await fetch(path, { signal, ...(body === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+  }) });
+  const raw = await response.text();
+  let result;
+  try { result = JSON.parse(raw); } catch { throw new Error(`Research API ${response.status}: ${raw.slice(0, 240) || "empty response"}`); }
+  if (!response.ok || result?.error || result?.detail) {
+    const reason = result.error ?? result.detail ?? raw;
+    throw new Error(typeof reason === "string" ? reason : JSON.stringify(reason));
+  }
+  if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("Research API returned an invalid record.");
+  return result;
+}
+
+const RESEARCH_MODE_NOTES = {
+  generate: "One greedy generation with the target configuration. No baseline or reverse arm is run implicitly.",
+  score: "Teacher-force one exact completion. Sequence likelihood is separate from exact-match task accuracy.",
+  experiment: "Paired experiments require the persisted runner, declared tasks and independent data custody.",
+  researcher: "The inspected local model selects from a fixed action menu, with separate researcher and target configurations."
+};
+function researchError(selector, message = "") {
+  const el = $(selector); el.textContent = message; el.hidden = !message;
+}
+function researchOperationAvailable(mode) {
+  const overview = research.overview;
+  return !!(overview && overview.model_key === index.model_key && overview.live_model_enabled &&
+    overview.admission?.allowed !== false &&
+    overview.operations?.[mode === "experiment" ? "jobs" : mode] === true);
+}
+function researchControls() {
+  const mode = $("#r-mode").value, available = researchOperationAvailable(mode);
+  for (const option of $("#r-mode").options) option.disabled = !researchOperationAvailable(option.value);
+  $("#r-answer-fields").hidden = !["score", "experiment"].includes(mode);
+  $("#r-answers").required = ["score", "experiment"].includes(mode);
+  $("#r-researcher-fields").hidden = mode !== "researcher";
+  $("#r-mode-note").textContent = RESEARCH_MODE_NOTES[mode];
+  $("#r-max-tokens").disabled = mode === "score";
+  $("#r-neuron-fields").hidden = !$("#r-use-neuron").checked;
+  $("#r-target-preset").disabled = !research.overview?.operations?.presets;
+  $("#r-researcher-preset").disabled = !research.overview?.operations?.presets;
+  $("#r-budget-fields").hidden = !["experiment", "researcher"].includes(mode);
+  $("#r-split").disabled = mode !== "experiment";
+  $("#r-prompt").required = mode !== "researcher" || !$("#r-episode").value;
+  $("#r-preset-save").disabled = !research.overview?.operations?.presets || research.busy;
+  $("#r-calibrate").disabled = !research.overview?.operations?.calibrate || research.busy;
+  $("#r-submit").disabled = research.busy || research.refreshing || !available;
+  $("#r-submit").textContent = research.busy ? "Request running…" : ({score: "Score complete answer", generate: "Generate one arm", experiment: "Start paired job", researcher: "Choose next action"})[mode];
+  $("#r-submit-note").textContent = !available ? "This operation is unavailable on the current server." :
+    mode === "experiment" ? "One paired task with a frozen specification, durable progress and explicit resume." :
+    mode === "researcher" ? "The local model scores every displayed action ID. Choosing an action does not evaluate the target." :
+    "Direct development probe. Retain paired controls separately.";
+  $("#r-use-selection").disabled = !state.focus || state.focus.kind !== "neuron";
+  $("#r-target-note").textContent = $("#r-use-neuron").checked ?
+    (research.overview?.runtime?.dose_units || "Use this checkpoint's reported dose calibration.") :
+    "Baseline uses no intervention. Saved weights stay unchanged.";
+  $("#r-refresh").disabled = research.refreshing;
+}
+async function refreshResearch() {
+  const version = ++research.refreshVersion;
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 8000);
+  research.refreshing = true; researchControls();
+  try {
+    const overview = await researchRequest("/api/research/overview", undefined, ctl.signal);
+    if (version !== research.refreshVersion) return;
+    research.overview = overview;
+    const mismatch = overview.model_key !== index.model_key;
+    const messages = [mismatch ? "Checkpoint changed. Reload this page before executing a request." :
+      `${modelName} · ${overview.model_key} · ${overview.runtime?.backend || "backend not reported"}`];
+    if (!overview.live_model_enabled) messages.push("Live execution is disabled on this server.");
+    else if (!overview.runtime?.inference_loaded) messages.push("Inference is not loaded. Execution remains subject to memory admission and the shared model lease.");
+    if (overview.live_validation?.validated !== true) messages.push("Live numerical validation has not been established for these research tools.");
+    if (overview.admission?.allowed === false) messages.push(`Resource blocked: ${overview.admission.reason || "admission refused"}`);
+    $("#r-readiness").textContent = messages.join("\n");
+    $("#r-readiness").dataset.tone = mismatch ? "error" : "info";
+    $("#r-max-tokens").max = Math.min(256, overview.limits?.max_new || 256);
+    $("#r-deadline").max = Math.min(300, overview.limits?.timeout_seconds || 300);
+    $("#r-layer").max = arch.n_layers - 1; $("#r-neuron").max = arch.inter - 1;
+    await refreshResearchRecords(ctl.signal);
+
+  } catch (error) {
+    if (version !== research.refreshVersion) return;
+    research.overview = null;
+    $("#r-readiness").textContent = `Research tools unavailable: ${ctl.signal.aborted ? "overview request timed out" : error.message}`;
+    $("#r-readiness").dataset.tone = "error";
+    $("#r-preset-state").textContent = "Unavailable";
+  } finally {
+    clearTimeout(timer);
+    if (version === research.refreshVersion) { research.refreshing = false; researchControls(); }
+  }
+}
+function researchNumber(selector, label, min, max, integer = true) {
+  const value = $(selector).valueAsNumber;
+  if (!Number.isFinite(value) || (integer && !Number.isInteger(value)) || value < min || value > max) {
+    throw new Error(`${label} must be ${integer ? "an integer" : "a finite number"} from ${min} to ${max}.`);
+  }
+  return value;
+}
+async function researchBody(mode) {
+  if (!researchOperationAvailable(mode)) throw new Error("Refresh research tools before using this operation.");
+  const prompt = $("#r-prompt").value;
+  if (!prompt.trim() && !(mode === "researcher" && $("#r-episode").value)) throw new Error("Enter a prompt.");
+  const neurons = $("#r-use-neuron").checked ? [{
+    layer: researchNumber("#r-layer", "Layer", 0, arch.n_layers - 1),
+    n: researchNumber("#r-neuron", "Neuron", 0, arch.inter - 1),
+    mode: $("#r-intervention-mode").value,
+    dose: researchNumber("#r-dose", "Dose", -Number.MAX_VALUE, Number.MAX_VALUE, false)
+  }] : [];
+  const preset = $("#r-target-preset").value;
+  if (preset) {
+    const config = await researchRequest("/api/research/presets/replay", {id: preset});
+    neurons.unshift(...config.pushes.map(([layer,n,dose,mode]) => ({layer,n,dose,mode})));
+  }
+  const timeout_seconds = researchNumber("#r-deadline", "Deadline", 1, Number($("#r-deadline").max));
+  if (mode === "experiment") {
+    return {name: "Paired task", split: $("#r-split").value,
+      candidate_frozen: $("#r-frozen").checked,
+      seed: researchNumber("#r-seed", "Seed", 0, 2147483647),
+      items: [{id: "task-1", prompt, answer: $("#r-answers").value}],
+      baseline: {pushes: []}, treatment: {pushes: neurons.map(p => [p.layer,p.n,p.dose,p.mode])},
+      max_new: researchNumber("#r-max-tokens", "Token limit", 1, 256),
+      limits: {max_requests: researchNumber("#r-requests", "Request budget", 1, 512),
+               max_tokens: researchNumber("#r-token-budget", "Token budget", 1, 1048576),
+               max_wall_seconds: timeout_seconds}};
+  }
+  if (mode === "researcher") {
+    return {timeout_seconds, feedback: JSON.parse($("#r-feedback").value || "[]"),
+      protocol: {menu: JSON.parse($("#r-menu").value || "[]"), brief: prompt,
+        seed: researchNumber("#r-seed", "Seed", 0, 2147483647),
+        target_config: {pushes: neurons.map(p => [p.layer,p.n,p.dose,p.mode])},
+        researcher_config: $("#r-researcher-preset").value ?
+          await researchRequest("/api/research/presets/replay", {id: $("#r-researcher-preset").value}) : {pushes: []},
+        budget: {max_requests: researchNumber("#r-requests", "Request budget", 1, 512),
+          max_tokens: researchNumber("#r-token-budget", "Token budget", 1, 1048576),
+          max_seconds: timeout_seconds, max_decisions: 16}}};
+  }
+  if (mode === "score") {
+    const completion = $("#r-answers").value;
+    if (!completion) throw new Error("Enter the exact completion to score.");
+    return { text: prompt, completion, chat: true, prefix: "", neurons, eos_policy: $("#r-eos").value, timeout_seconds };
+  }
+  return { messages: [{ role: "user", content: prompt }], neurons,
+    max_new: researchNumber("#r-max-tokens", "Token limit", 1, Number($("#r-max-tokens").max)), timeout_seconds };
+}
+function containsFirstTokenOnly(value) {
+  return !!(value && typeof value === "object" && (value.first_token_only === true || Object.values(value).some(containsFirstTokenOnly)));
+}
+function checkResearchResult(probe, result) {
+  if (result.execution_started === false && !result.completed && ["canceled", "deadline"].includes(result.finish_reason)) return;
+  if (containsFirstTokenOnly(result)) throw new Error("Rejected first-token-only result. A multi-token answer requires complete-sequence scoring.");
+  const ids = probe.mode === "score" ? result.completion_token_ids : result.output_token_ids;
+  if (!Array.isArray(ids) || ids.some(id => !Number.isInteger(id) || id < 0) ||
+      !Array.isArray(result.prompt_token_ids) || !result.counts || typeof result.completed !== "boolean") {
+    throw new Error("Incomplete runtime record: exact token IDs, counts and completion status are required.");
+  }
+  if (probe.mode === "score") {
+    const scores = result.per_token_logprobs;
+    if (!ids.length || !Array.isArray(scores) || scores.some(x => !Number.isFinite(x) || x > 1e-6) ||
+        scores.length > ids.length || result.counts.scored_tokens !== scores.length ||
+        result.counts.requested_tokens !== ids.length || result.eos_policy !== probe.body.eos_policy) {
+      throw new Error("Invalid complete-answer record: token coverage, EOS policy or finite per-token scores do not match.");
+    }
+    if (result.completed) {
+      const sum = scores.reduce((a, b) => a + b, 0);
+      if (scores.length !== ids.length || result.finish_reason !== "completed" ||
+          !Number.isFinite(result.total_logprob) || Math.abs(sum - result.total_logprob) > 1e-6 * Math.max(1, Math.abs(sum)) ||
+          !Number.isFinite(result.mean_logprob) || Math.abs(sum / ids.length - result.mean_logprob) > 1e-6) {
+        throw new Error("Incomplete or inconsistent sequence score. Every answer token must contribute to the reported total and mean.");
+      }
+    }
+  } else if (typeof result.text !== "string" || result.counts.output_tokens !== ids.length ||
+             (result.completed && !["eos", "length"].includes(result.finish_reason))) {
+    throw new Error("Invalid generation record: exact output tokens, text and stop reason must agree.");
+  }
+}
+const researchValue = (value, digits = 0) => Number.isFinite(value) ? value.toLocaleString(undefined, { maximumFractionDigits: digits }) : "Unavailable";
+function researchResultHTML(probe) {
+  const result = probe.result;
+  if (!result || probe.rejected) return "";
+  if (probe.mode === "generate") return `<div class="lab">TARGET OUTPUT · ONE ARM</div><pre class="r-output-text">${esc(result.text)}</pre><p class="r-help">Stop token ID: ${esc(result.stop_token_id ?? "none")} · ${esc(result.eos_policy || "EOS policy unreported")}</p>`;
+  const complete = result.completed;
+  const tokens = result.completion_token_ids, scores = result.per_token_logprobs;
+  const summary = complete ? `<div class="r-metrics"><div class="r-metric"><span>Sequence log probability</span><strong>${researchValue(result.total_logprob, 6)}</strong></div><div class="r-metric"><span>Mean per token</span><strong>${researchValue(result.mean_logprob, 6)}</strong></div></div>` :
+    '<p class="r-error">Partial answer score. A complete sequence score is unavailable.</p>';
+  return `${summary}<p class="r-help">${scores.length} / ${tokens.length} tokens scored · EOS ${esc(result.eos_policy)} · sum without a length penalty. This is likelihood, not task accuracy.</p><div class="r-table-wrap"><table class="r-table"><thead><tr><th>Answer position</th><th class="num">Contextual token ID</th><th class="num">Log probability</th></tr></thead><tbody>${tokens.map((id, i) => `<tr><td>${i}${result.eos_policy === "include" && i === tokens.length - 1 ? " · EOS" : ""}</td><td class="num">${id}</td><td class="num">${i < scores.length ? researchValue(scores[i], 6) : "Not scored"}</td></tr>`).join("")}</tbody></table></div>`;
+}
+function renderResearchProbe() {
+  const probe = research.probe;
+  $("#r-job").hidden = !probe; $("#r-job-empty").hidden = !!probe;
+  if (!probe) return;
+  if (["experiment", "researcher"].includes(probe.mode)) { renderResearchRecord(); return; }
+  const labels = { running: "Running", completed: "Completed", failed: "Failed", partial: "Partial result", cancel_requested: "Cancel requested · unconfirmed", canceled: "Canceled · worker returned", deadline: "Deadline reached" };
+  $("#r-job-state").textContent = labels[probe.state] || probe.state;
+  $("#r-job-state").dataset.state = probe.state;
+  $("#r-job-id").textContent = "Direct probe · not persisted";
+
+  $("#r-progress-text").textContent = probe.state === "running" ? "Waiting for runtime result and cleanup" :
+    probe.state === "cancel_requested" ? "Worker acknowledgment is unavailable for a disconnected direct request" : "Direct request ended";
+  const progress = $("#r-progress");
+  if (["running", "cancel_requested"].includes(probe.state)) progress.removeAttribute("value");
+  else { progress.max = 1; progress.value = 1; }
+  $("#r-cancel").disabled = !research.ctl || probe.state !== "running";
+  $("#r-resume").disabled = true;
+  $("#r-resume").title = "Direct requests are not resumable. A persisted runner job is required.";
+  $("#r-job-refresh").hidden = true;
+  $("#r-stop-reason").textContent = probe.reason || "The server's deadline and serialized worker remain in force.";
+  researchError("#r-job-error", probe.error);
+  const result = probe.result;
+  const counts = result?.counts;
+  $("#r-resources").innerHTML = counts ? [
+    ["Prompt tokens", counts.prompt_tokens], [probe.mode === "score" ? "Scored tokens" : "Output tokens", probe.mode === "score" ? counts.scored_tokens : counts.output_tokens],
+    ["Evaluated tokens", counts.evaluated_tokens], ["Forward passes", counts.forward_passes], ["Runtime seconds", counts.wall_seconds, 3]
+  ].map(([label, value, digits]) => `<div class="r-metric"><span>${label}</span><strong>${researchValue(value, digits || 0)}</strong></div>`).join("") : "";
+  $("#r-output").innerHTML = researchResultHTML(probe);
+  $("#r-provenance").textContent = JSON.stringify({
+    operation: probe.mode, request: probe.body,
+    model_key: probe.overview.model_key, identity: probe.overview.identity,
+    runtime: probe.overview.runtime, calibration: probe.overview.calibration,
+    live_validation: probe.overview.live_validation,
+    persistence: "Direct development probe; not a resumable experiment or an untouched-final evaluation.",
+    response: result ?? null
+  }, null, 2);
+}
+async function submitResearch(event) {
+  event.preventDefault();
+  if (research.busy) return;
+  researchError("#r-form-error");
+  let body;
+  const mode = $("#r-mode").value;
+  research.busy = true; researchControls();
+  try { body = await researchBody(mode); } catch (error) {
+    research.busy = false; researchControls(); researchError("#r-form-error", error.message); return;
+  }
+  if (mode === "experiment" || mode === "researcher") {
+    await submitResearchRecord(mode, body); return;
+  }
+  const ctl = new AbortController(); research.ctl = ctl; research.busy = true;
+  const probe = research.probe = { mode, body, overview: structuredClone(research.overview), state: "running", result: null, error: "", reason: "" };
+  // A lost response cannot establish that native cleanup finished. Abort is
+  // cancellation requested, never an acknowledged stopped/restored state.
+  const timer = setTimeout(() => { probe.reason = "Response deadline exceeded. Worker stop and baseline restoration are unconfirmed."; ctl.abort(); }, (body.timeout_seconds + 15) * 1000);
+  researchControls(); renderResearchProbe();
+  try {
+    const result = await researchRequest(`/api/research/${mode}`, body, ctl.signal);
+    probe.result = result;
+    try { checkResearchResult(probe, result); } catch (error) { probe.rejected = true; throw error; }
+    const finish = result.finish_reason;
+    probe.state = finish === "cancelled" || finish === "canceled" ? "canceled" : finish === "deadline" ? "deadline" : result.completed ? "completed" : "partial";
+    const cleanup = result.cleanup?.interventions_cleared === true && result.cleanup?.cache_cleared === true;
+    probe.reason = `Runtime stop reason: ${finish || "unreported"}. ${cleanup ? "Request cleanup reported: intervention and cache state cleared." : "Request cleanup was not confirmed by this record."}`;
+  } catch (error) {
+    if (ctl.signal.aborted) {
+      probe.state = "cancel_requested";
+      probe.reason ||= "Browser request disconnected. Worker stop and baseline restoration are unconfirmed; this direct request cannot resume.";
+    } else { probe.state = "failed"; probe.error = error.message; }
+  } finally {
+    clearTimeout(timer); research.ctl = null; research.busy = false;
+    renderResearchProbe(); researchControls();
+  }
+}
+async function refreshResearchRecords(signal) {
+  if (research.overview?.operations?.presets) {
+    const result = await researchRequest("/api/research/presets?limit=100", undefined, signal);
+    research.presets = result.items;
+    for (const selector of ["#r-target-preset", "#r-researcher-preset"]) {
+      const el = $(selector), selected = el.value;
+      el.innerHTML = '<option value="">Unsteered baseline</option>' + result.items.map(p =>
+        `<option value="${p.id}">${esc(p.label || p.id.slice(0,12))}</option>`).join("");
+      if (result.items.some(p => p.id === selected)) el.value = selected;
+    }
+    $("#r-preset-state").textContent = `${result.items.length} saved`;
+    $("#r-presets").textContent = result.items.length ? result.items.map(p =>
+      `${p.label || p.id.slice(0,12)} · ${p.config.pushes.length} edits · ${p.parents.length} parents`).join("\n") : "No presets saved.";
+  }
+  if (research.overview?.operations?.jobs) {
+    const result = await researchRequest("/api/research/jobs?limit=100", undefined, signal);
+    const selected = research.probe?.mode === "experiment" ? research.probe.id : "";
+    $("#r-jobs").innerHTML = '<option value="">Choose a persisted job</option>' + result.items.map(job =>
+      `<option value="${esc(job.id)}">${esc(job.name)} · ${esc(job.split)} · ${esc(job.state)}</option>`).join("");
+    $("#r-jobs").value = selected || "";
+    $("#r-jobs").disabled = false;
+  }
+}
+function renderResearchRecord() {
+  const probe = research.probe, result = probe.result;
+  const paired = probe.mode === "experiment";
+  const running = paired ? ["queued", "running", "canceling"].includes(result?.state) : research.busy;
+  $("#r-job-state").textContent = result?.state || probe.state || "Waiting";
+  $("#r-job-state").dataset.state = result?.state || probe.state;
+  $("#r-job-id").textContent = probe.id || "Creating record…";
+  $("#r-progress-text").textContent = paired && result?.progress ?
+    `${result.progress.completed_arms} / ${result.progress.total_arms} arms completed` : "Fixed-menu action selection";
+  const progress = $("#r-progress");
+  if (paired && result?.progress) { progress.max = result.progress.total_arms; progress.value = result.progress.completed_arms; }
+  else if (running) progress.removeAttribute("value");
+  else { progress.max = 1; progress.value = 1; }
+  $("#r-cancel").disabled = !((paired && running) || (!paired && research.ctl));
+  $("#r-resume").disabled = !paired || !["canceled", "failed", "interrupted"].includes(result?.state);
+  $("#r-resume").title = "Resume missing arms with the same specification, identity and remaining budget.";
+  $("#r-job-refresh").hidden = !probe.id;
+  $("#r-stop-reason").textContent = paired ?
+    (result?.cleanup_acknowledged ? "Worker returned; request cleanup acknowledged." : "Work may still be running or interrupted. Refresh its persisted status.") :
+    "Action selection uses the inspected local model. The chosen target intervention has not been evaluated by this decision.";
+  researchError("#r-job-error", probe.error || result?.error || "");
+  const costs = paired ? result?.costs : result?.cost || result?.snapshot?.cost;
+  $("#r-resources").innerHTML = costs ? Object.entries(costs).filter(([k,v]) => typeof v === "number").map(([k,v]) =>
+    `<div class="r-metric"><span>${esc(k.replaceAll("_", " "))}</span><strong>${researchValue(v,3)}</strong></div>`).join("") : "";
+  const summary = paired ? result?.outcomes : result?.action || result?.snapshot?.events?.filter(e => e.event === "decision").at(-1);
+  $("#r-output").innerHTML = summary ? `<pre>${esc(JSON.stringify(summary,null,2))}</pre>` : '<p class="r-help">Waiting for a persisted result.</p>';
+  $("#r-provenance").textContent = JSON.stringify(result || {request: probe.body}, null, 2);
+}
+async function updateResearchJob(action) {
+  const probe = research.probe;
+  if (!probe?.id || !["experiment", "researcher"].includes(probe.mode)) return;
+  clearTimeout(research.pollTimer);
+  try {
+    const root = probe.mode === "experiment" ? "jobs" : "researchers";
+    const result = await researchRequest(`/api/research/${root}/${encodeURIComponent(probe.id)}${action ? `/${action}` : ""}`, action ? {} : undefined);
+    if (probe !== research.probe) return;
+    probe.result = result; probe.error = "";
+    renderResearchProbe();
+    if (probe.mode === "experiment" && ["queued", "running", "canceling"].includes(result.state)) {
+      research.pollTimer = setTimeout(() => updateResearchJob(), 1000);
+    }
+  } catch (error) { probe.error = error.message; renderResearchProbe(); }
+}
+async function submitResearchRecord(mode, body) {
+  const ctl = new AbortController();
+  research.busy = true; research.ctl = ctl;
+  const probe = research.probe = {mode, body, overview: research.overview, state: "running", result: null};
+  const seconds = mode === "experiment" ? 30 : body.timeout_seconds + 15;
+  const timer = setTimeout(() => ctl.abort(), seconds * 1000);
+  researchControls(); renderResearchProbe();
+  try {
+    if (mode === "experiment") {
+      const result = await researchRequest("/api/research/jobs", body, ctl.signal);
+      probe.id = result.id; probe.result = result;
+    } else {
+      let id = $("#r-episode").value.trim();
+      if (!id) {
+        const episode = await researchRequest("/api/research/researchers", body.protocol, ctl.signal);
+        id = episode.id; $("#r-episode").value = id;
+      }
+      probe.id = id;
+      probe.result = await researchRequest(`/api/research/researchers/${encodeURIComponent(id)}/choose`,
+        {feedback: body.feedback, timeout_seconds: body.timeout_seconds}, ctl.signal);
+      probe.state = probe.result.completed ? "completed" : probe.result.finish_reason;
+    }
+    await refreshResearchRecords();
+  } catch (error) {
+    probe.state = ctl.signal.aborted ? "cancel_requested" : "failed";
+    probe.error = ctl.signal.aborted ? "Response disconnected. Refresh the saved record to confirm worker status." : error.message;
+  } finally {
+    clearTimeout(timer); research.busy = false; research.ctl = null;
+    renderResearchProbe(); researchControls();
+    if (mode === "experiment" && probe.id) await updateResearchJob();
+  }
+}
+async function researchPresetAction(action) {
+  try {
+    const left = $("#r-target-preset").value, right = $("#r-researcher-preset").value;
+    let result;
+    if (action === "baseline") {
+      result = await researchRequest("/api/research/presets/restore", {id: null});
+      $("#r-target-preset").value = ""; $("#r-use-neuron").checked = false;
+    } else if (action === "save") {
+      const parents = left ? [left] : [];
+      const config = left ? await researchRequest("/api/research/presets/replay", {id: left}) : {pushes: []};
+      const neurons = config.pushes.map(([layer,n,dose,mode]) => ({layer,n,dose,mode}));
+      if ($("#r-use-neuron").checked) neurons.push({
+        layer: researchNumber("#r-layer", "Layer", 0, arch.n_layers-1), n: researchNumber("#r-neuron", "Neuron", 0, arch.inter-1),
+        dose: researchNumber("#r-dose", "Dose", -100, 100, false), mode: $("#r-intervention-mode").value});
+      result = await researchRequest("/api/research/presets", {neurons, parents, label: $("#r-preset-label").value});
+    } else {
+      if (!left || !right) throw new Error("Select both a target preset and a researcher preset.");
+      result = await researchRequest(`/api/research/presets/${action}`, action === "compare" ? {left,right} :
+        {ids: [left,right], label: $("#r-preset-label").value});
+    }
+    $("#r-preset-detail").textContent = JSON.stringify(result,null,2);
+    await refreshResearchRecords(); researchControls();
+  } catch (error) { $("#r-preset-detail").textContent = error.message; }
+}
+for (const action of ["save", "baseline", "compare", "compose"]) $("#r-preset-"+action).onclick = () => researchPresetAction(action);
+
+$("#r-form").addEventListener("submit", submitResearch);
+$("#r-refresh").onclick = refreshResearch;
+$("#r-mode").onchange = researchControls;
+$("#r-use-neuron").onchange = researchControls;
+$("#r-use-selection").onclick = () => {
+  const focus = state.focus;
+  if (!focus || focus.kind !== "neuron") return;
+  $("#r-layer").value = focus.layer; $("#r-neuron").value = focus.n;
+  $("#r-intervention-mode").value = state.chat.mode; $("#r-dose").value = state.chat.dose[state.chat.mode];
+};
+$("#r-calibrate").onclick = async () => {
+  research.busy = true; researchControls(); researchError("#r-form-error");
+  try {
+    const result = await researchRequest("/api/research/calibrate", {
+      layers: [researchNumber("#r-layer", "Layer", 0, arch.n_layers-1)],
+      timeout_seconds: researchNumber("#r-deadline", "Deadline", 1, 300)});
+    $("#r-preset-detail").textContent = JSON.stringify(result,null,2);
+    await refreshResearch();
+  } catch (error) { researchError("#r-form-error", error.message); }
+  finally { research.busy = false; researchControls(); }
+};
+$("#r-cancel").onclick = () => {
+  if (research.probe?.mode === "experiment") { updateResearchJob("cancel"); return; }
+  if (!research.ctl) return;
+  research.probe.state = "cancel_requested";
+  research.probe.reason = "Cancel requested by disconnecting. Worker acknowledgment and baseline restoration remain unconfirmed.";
+  research.ctl.abort(); renderResearchProbe();
+};
+$("#r-resume").onclick = () => updateResearchJob("resume");
+$("#r-job-refresh").onclick = () => updateResearchJob();
+$("#r-jobs").onchange = async () => {
+  const id = $("#r-jobs").value;
+  if (!id) return;
+  research.probe = {mode: "experiment", id, overview: research.overview};
+  await updateResearchJob();
+};
+researchControls();
 
 // ---------- claude: the Claude tab, one claude -p session per conversation ----------
 const agent = { chat: null, ctl: null };

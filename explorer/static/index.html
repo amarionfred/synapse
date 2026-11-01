@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Synapse · Neuron Explorer</title>
-<link rel="stylesheet" href="style.css?v=62">
+<link rel="stylesheet" href="style.css?v=63">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 rx=%223%22 fill=%22%23151515%22/%3E%3Ccircle cx=%228%22 cy=%228%22 r=%222.5%22 fill=%22%23ffd27a%22/%3E%3C/svg%3E">
 <script type="importmap">
 {"imports": {
@@ -19,6 +19,7 @@
   <nav id="views">
     <button data-view="map" class="on">map</button>
     <button data-view="embed">embeddings</button>
+    <button data-view="research">research</button>
   </nav>
   <select id="layer" aria-label="layer"></select>
   <span class="seg" id="layout-mode" title="sheet layout"><button data-k="index">index</button><button data-k="writes" class="on">writes</button></span>
@@ -61,6 +62,81 @@
       </span>
     </div>
     <div id="tip" class="float"></div>
+  </section>
+
+  <section id="research-view" class="view" aria-labelledby="r-heading">
+    <div class="research-shell">
+      <div class="r-heading">
+        <div><div class="lab">INSPECTED CHECKPOINT / BOUNDED EXECUTION</div><h1 id="r-heading">Local research</h1><p class="dim">Run a declared configuration, score complete answers, and keep the evidence.</p></div>
+        <button id="r-refresh" class="r-button" type="button">Refresh tools</button>
+      </div>
+      <div id="r-readiness" class="r-notice" role="status">Research tools have not been checked.</div>
+      <div class="r-workspace">
+        <form id="r-form" class="r-composer">
+          <label class="r-field">Operation<select id="r-mode"><option value="generate">Single-arm generation</option><option value="score">Complete-answer scoring</option><option value="experiment">Paired experiment</option><option value="researcher">Local researcher · fixed menu</option></select></label>
+          <p id="r-mode-note" class="r-help">Generate once with the target configuration.</p>
+          <label class="r-field">Prompt<textarea id="r-prompt" rows="4" maxlength="12000" required placeholder="A bounded task for the inspected model…" spellcheck="false"></textarea></label>
+          <div id="r-answer-fields" hidden>
+            <label class="r-field">Exact completion<textarea id="r-answers" rows="3" maxlength="12000" spellcheck="false" placeholder="The complete answer, including its exact spacing"></textarea></label>
+            <label class="r-field">End-of-sequence scoring<select id="r-eos"><option value="exclude">Exclude EOS · answer tokens only</option><option value="include">Include EOS · answer and termination</option></select></label>
+            <p class="r-help">Spaces are significant. Every answer token must be scored; next-token scores cannot stand in for a multi-token answer.</p>
+          </div>
+          <div id="r-researcher-fields" hidden>
+            <label class="r-field">Fixed action menu<textarea id="r-menu" rows="4" maxlength="12000" spellcheck="false" placeholder="Action menu supplied by the research controller"></textarea></label>
+            <p class="r-help">Actions use [{"id":"control","description":"Keep the target unchanged","pushes":[]}]. The menu and prompt freeze when an episode is created.</p>
+            <label class="r-field">Episode ID · blank creates a new episode<input id="r-episode" type="text" maxlength="64" placeholder="researcher-…"></label>
+            <label class="r-field">Development feedback<textarea id="r-feedback" rows="2" maxlength="12000" spellcheck="false" placeholder='[{"split":"development","action_id":"control","correct":1,"total":4}]'></textarea></label>
+            <label class="r-field">Researcher configuration<select id="r-researcher-preset"><option value="">Unsteered baseline</option></select></label>
+          </div>
+          <fieldset class="r-config"><legend>Target configuration</legend>
+            <label class="r-field">Preset<select id="r-target-preset"><option value="">Unsteered baseline</option></select></label>
+            <label class="r-check"><input id="r-use-neuron" type="checkbox"> Apply one MLP intervention</label>
+            <div id="r-neuron-fields" hidden>
+              <div class="r-fields"><label class="r-field">Layer<input id="r-layer" type="number" min="0" step="1" value="0" required></label><label class="r-field">Neuron<input id="r-neuron" type="number" min="0" step="1" value="0" required></label></div>
+              <div class="r-fields"><label class="r-field">Mode<select id="r-intervention-mode"><option value="add">Add</option><option value="mul">Multiply</option></select></label><label class="r-field">Dose<input id="r-dose" type="number" step="any" value="0.8" required></label></div>
+              <button id="r-use-selection" type="button" class="r-text-button">Use selected neuron</button>
+              <button id="r-calibrate" type="button" class="r-text-button">Calibrate this layer</button>
+            </div>
+            <p id="r-target-note" class="r-help">Baseline uses no intervention. Saved weights stay unchanged.</p>
+          </fieldset>
+          <div class="r-fields"><label class="r-field">Token limit<input id="r-max-tokens" type="number" min="1" max="256" step="1" value="64" required></label><label class="r-field">Deadline · seconds<input id="r-deadline" type="number" min="1" max="300" step="1" value="60" required></label></div>
+          <div id="r-budget-fields" hidden>
+            <div class="r-fields"><label class="r-field">Request budget<input id="r-requests" type="number" min="1" max="512" value="16" step="1"></label><label class="r-field">Token budget<input id="r-token-budget" type="number" min="1" max="1048576" value="32768" step="1"></label></div>
+            <div class="r-fields"><label class="r-field">Seed<input id="r-seed" type="number" min="0" max="2147483647" step="1" value="0"></label><label class="r-field">Data role<select id="r-split"><option value="development">Development</option><option value="validation">Candidate validation</option><option value="final">Untouched final</option></select></label></div>
+            <label class="r-check"><input id="r-frozen" type="checkbox"> Candidate was frozen before final evaluation</label>
+            <p class="r-help">Paired jobs charge prompt plus answer tokens; researcher episodes charge evaluated tokens. Unknown work keeps its reservation. Researchers accept development summaries only.</p>
+          </div>
+          <p id="r-submit-note" class="r-help">Check server capabilities before starting a job.</p>
+          <button id="r-submit" class="r-button r-primary" type="submit" disabled>Start bounded job</button>
+          <div id="r-form-error" class="r-error" role="alert" hidden></div>
+        </form>
+        <div class="r-results">
+          <section class="r-run-section" aria-labelledby="r-run-heading">
+            <div class="r-section-heading"><h2 id="r-run-heading">Run record</h2><span id="r-job-state" class="r-state">No job selected</span></div>
+            <label class="r-field">Recent jobs<select id="r-jobs"><option value="">No jobs loaded</option></select></label>
+            <div id="r-job-empty" class="r-empty"><span class="mono">01 / DECLARE → EXECUTE → COMPARE</span><p>A run keeps its prompt, configurations, complete scores and actual resource use together.</p><p class="dim">Local research uses the inspected checkpoint. The Agent tab remains your external Codex / Claude conversation.</p></div>
+            <div id="r-job" hidden>
+              <div class="r-progress-heading"><span id="r-progress-text"></span><span id="r-job-id" class="mono dim"></span></div>
+              <progress id="r-progress" aria-label="Completed work"></progress>
+              <p id="r-stop-reason" class="r-help"></p>
+              <div class="r-actions"><button id="r-cancel" class="r-button" type="button" disabled>Request cancel</button><button id="r-resume" class="r-button" type="button" disabled>Resume job</button><button id="r-job-refresh" class="r-text-button" type="button">Refresh record</button></div>
+              <div id="r-job-error" class="r-error" role="alert" hidden></div>
+              <div id="r-resources" class="r-metrics"></div>
+              <div id="r-output"></div>
+              <details class="r-details"><summary>Configuration &amp; provenance</summary><pre id="r-provenance"></pre></details>
+            </div>
+          </section>
+          <section class="r-preset-section" aria-labelledby="r-preset-heading">
+            <div class="r-section-heading"><h2 id="r-preset-heading">Intervention presets</h2><span id="r-preset-state" class="dim">Not checked</span></div>
+            <p class="r-help">Immutable configurations keep their ancestry and checkpoint, runtime, calibration and evaluation identity.</p>
+            <label class="r-field">Preset label<input id="r-preset-label" maxlength="200" placeholder="A short description"></label>
+            <div class="r-actions"><button id="r-preset-save" class="r-button" type="button">Save target</button><button id="r-preset-baseline" class="r-text-button" type="button">Restore baseline</button><button id="r-preset-compare" class="r-text-button" type="button">Compare selected</button><button id="r-preset-compose" class="r-text-button" type="button">Compose selected</button></div>
+            <div id="r-presets" class="r-preset-list"></div>
+            <pre id="r-preset-detail" class="r-help"></pre>
+          </section>
+        </div>
+      </div>
+    </div>
   </section>
 
   <aside id="list" class="float">
@@ -121,6 +197,6 @@
     </div>
   </aside>
 </main>
-<script type="module" src="app.js?v=100"></script>
+<script type="module" src="app.js?v=103"></script>
 </body>
 </html>

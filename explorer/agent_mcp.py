@@ -12,9 +12,58 @@ URL = os.environ.get("EXPLORER_URL", "http://127.0.0.1:8791")
 CHAT = os.environ.get("EXPLORER_CHAT", "")
 
 LN = {"layer": {"type": "integer", "description": "zero-based layer; bounds from overview"}, "n": {"type": "integer", "description": "zero-based MLP output-projection input; bounds from overview"}}
+RESEARCH_NEURONS = {"type": "array", "maxItems": 32, "items": {
+    "type": "object", "properties": {**LN, "dose": {"type": "number", "default": 0.8},
+                                        "mode": {"type": "string", "enum": ["add", "mul"]}},
+    "required": ["layer", "n"], "additionalProperties": False}}
+SCOPES = {
+    "interventions": {"type": "array", "maxItems": 128, "items": {"type": "object",
+        "properties": {**LN, "dose": {"type": "number"}, "mode": {"enum": ["add", "mul"]},
+            "prompt_positions": {"type": "array", "maxItems": 2048, "items": {"type": "integer", "minimum": 0, "maximum": 2047}},
+            "decode_steps": {"type": "array", "maxItems": 1024, "items": {"type": "integer", "minimum": 0, "maximum": 1023}}},
+        "required": ["layer", "n", "dose", "mode"], "additionalProperties": False}},
+    "patches": {"type": "object", "properties": {"reference": {"type": "object"},
+        "target_token_ids": {"type": "array", "maxItems": 2048, "items": {"type": "integer"}}},
+        "required": ["reference", "target_token_ids"], "additionalProperties": False},
+}
 TOOLS = [
     {"name": "overview", "description": "Model architecture and which layers have sweep runs (rollouts and rankings).",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "research_overview", "description": "Research operation availability, checkpoint provenance, limits and live-validation status. Does not load inference. The inspected local model is separate from the external Agent.",
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "score_sequence", "description": "Score every token of one exact completion in rendered prompt context using teacher forcing. Returns contextual token IDs, per-token and total likelihood and provenance. This is a single arm; retain baseline/control results separately. Rejects unstable token boundaries. Live inference admission applies.",
+     "inputSchema": {"type": "object", "properties": {
+         "text": {"type": "string", "minLength": 1, "maxLength": 32768},
+         "completion": {"type": "string", "minLength": 1, "maxLength": 32768},
+         "chat": {"type": "boolean", "default": True},
+         "prefix": {"type": "string", "maxLength": 32768},
+         **SCOPES, "neurons": RESEARCH_NEURONS,
+         "eos_policy": {"type": "string", "enum": ["exclude", "include"], "default": "exclude"},
+         "timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 60}},
+         "required": ["text", "completion"], "additionalProperties": False}},
+    {"name": "generate_one", "description": "Generate one greedy arm from the inspected local model, with optional request-scoped MLP interventions. Returns exact output tokens, counts, stop reason and provenance; preserves baseline restoration and existing inference admission. Does not invoke the external Agent or launch a study.",
+     "inputSchema": {"type": "object", "properties": {
+         "messages": {"type": "array", "minItems": 1, "maxItems": 32, "items": {
+             "type": "object", "properties": {"role": {"type": "string", "enum": ["user", "assistant", "system"]},
+                                                 "content": {"type": "string", "minLength": 1, "maxLength": 32768}},
+             "required": ["role", "content"], "additionalProperties": False}},
+         **SCOPES, "neurons": RESEARCH_NEURONS,
+         "max_new": {"type": "integer", "minimum": 1, "maximum": 256, "default": 32},
+         "timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 60}},
+         "required": ["messages"], "additionalProperties": False}},
+    {"name": "capture_selected", "description": "Capture up to 4096 MLP scalars at [layer,position,neuron] before edits. Returns a checkpoint-bound hashed reference for matched activation patching; no full activation cube.",
+     "inputSchema": {"type": "object", "properties": {"text": {"type": "string"},
+       "selection": {"type": "array", "minItems": 1, "maxItems": 4096, "items": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "integer"}}},
+       "chat": {"type": "boolean"}, "prefix": {"type": "string"}, "neurons": RESEARCH_NEURONS,
+       "timeout_seconds": {"type": "number", "maximum": 300}}, "required": ["text", "selection"], "additionalProperties": False}},
+    {"name": "calibrate_research", "description": "Explicit bounded normalization on the fixed reference, before freezing additive experiments or presets. Uses existing inference admission and returns its cost and updated calibration identity.",
+     "inputSchema": {"type": "object", "properties": {"layers": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "integer"}}, "timeout_seconds": {"type": "number", "maximum": 300}}, "required": ["layers"], "additionalProperties": False}},
+    {"name": "research_job", "description": "Submit/list/status/cancel/resume bounded paired evaluator jobs using the existing serial runtime and SQLite store. Spec declares one split, exact labeled items, baseline/treatment pushes and request/token/wall limits. Final requires candidate_frozen=true. Feedback returns aggregate development outcomes only.",
+     "inputSchema": {"type": "object", "properties": {"action": {"enum": ["submit", "list", "status", "feedback", "cancel", "resume"]}, "id": {"type": "string"}, "spec": {"type": "object"}}, "required": ["action"], "additionalProperties": False}},
+    {"name": "intervention_preset", "description": "Save/list/get/compare/compose/replay/restore immutable MLP presets and ancestry in the existing store. Identity includes checkpoint, backend and calibration. Replay/restore returns next-request pushes; no persistent hook or weight change. Save accepts neurons, parents, evaluation and label in payload; compare takes left/right, compose ids, replay/restore id.",
+     "inputSchema": {"type": "object", "properties": {"action": {"enum": ["save", "list", "get", "ancestry", "compare", "compose", "replay", "restore"]}, "id": {"type": "string"}, "payload": {"type": "object"}}, "required": ["action"], "additionalProperties": False}},
+    {"name": "local_researcher", "description": "Create/status/choose a durable episode where the inspected local model scores a frozen action menu. Create protocol has menu [{id,description,pushes}], brief, seed, researcher_config, target_config and budget {max_requests,max_tokens,max_seconds,max_decisions}. Choose accepts development aggregates [{split,action_id,correct,total}] only. The external Agent must not adapt the frozen brief/menu. Chosen actions are evaluated separately on the identical target.",
+     "inputSchema": {"type": "object", "properties": {"action": {"enum": ["create", "status", "choose"]}, "id": {"type": "string"}, "protocol": {"type": "object"}, "feedback": {"type": "array"}, "timeout_seconds": {"type": "number", "maximum": 300}}, "required": ["action"], "additionalProperties": False}},
     {"name": "neuron", "description": "Inspect one neuron, computing supported live data on demand: name, logit lens and steer lens (with KL) for "
      "both poles, activation range, sweep rank if any, and its 24 strongest direct-path links each way (writes_into, "
      "reads_from) with each linked neuron's available lens labels, top words and name.",
@@ -156,7 +205,8 @@ TOOLS = [
 
 
 def get(path, **q):
-    with urllib.request.urlopen(f"{URL}{path}?{urllib.parse.urlencode(q)}", timeout=60) as r:
+    url = f"{URL}{path}" + ("?" + urllib.parse.urlencode(q) if q else "")
+    with urllib.request.urlopen(url, timeout=60) as r:
         return json.load(r)
 
 
@@ -169,6 +219,41 @@ def post(path, body, timeout=60):
 def call(name, a):
     if name == "overview":
         return get("/api/agent/overview")
+    if name == "research_overview":
+        return get("/api/research/overview")
+    if name == "score_sequence":
+        return post("/api/research/score", a, timeout=900)
+    if name == "generate_one":
+        return post("/api/research/generate", a, timeout=900)
+    if name in {"capture_selected", "calibrate_research"}:
+        return post("/api/research/" + ("capture" if name == "capture_selected" else "calibrate"), a, timeout=900)
+    if name == "research_job":
+        action = a["action"]
+        if action == "submit":
+            return post("/api/research/jobs", a["spec"])
+        if action == "list":
+            return get("/api/research/jobs")
+        path = "/api/research/jobs/" + urllib.parse.quote(a["id"], safe="")
+        if action in {"cancel", "resume"}:
+            return post(path + "/" + action, {})
+        return get(path + ("/feedback" if action == "feedback" else ""))
+    if name == "intervention_preset":
+        action, payload = a["action"], a.get("payload", {})
+        path = "/api/research/presets"
+        if action == "list":
+            return get(path)
+        if action in {"get", "ancestry"}:
+            return get(path + "/" + urllib.parse.quote(a["id"], safe="") + ("/ancestry" if action == "ancestry" else ""))
+        return post(path + ("" if action == "save" else "/" + action), payload)
+    if name == "local_researcher":
+        action = a["action"]
+        path = "/api/research/researchers"
+        if action == "create":
+            return post(path, a["protocol"])
+        path += "/" + urllib.parse.quote(a["id"], safe="")
+        if action == "status":
+            return get(path)
+        return post(path + "/choose", {"feedback": a.get("feedback", []), "timeout_seconds": a.get("timeout_seconds", 60)}, timeout=900)
     if name == "neuron":
         return get("/api/agent/neuron", layer=a["layer"], n=a["n"])
     if name == "rollouts":

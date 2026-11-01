@@ -148,7 +148,215 @@ index is not implemented. UMAP analysis dependencies are available with
 `uv sync --extra analysis`. The inherited vLLM sweep scripts remain specialized
 Qwen research utilities, not a general indexing pipeline.
 
+### Map selection and connection lines
+
+Selecting a neuron requests connection coordinates before unit metadata and
+neighbor labels. Cached coordinates bypass the serial native inspection queue;
+opening **Details** fills neighbor labels separately. The header reports link
+loading and then its connection count. New, uncached coordinates still require
+a read-only weight scan. Changing selection cancels stale GGUF label work between
+bounded output-row chunks. The map keeps a selected neuron in the visible gap
+between side panels, preserving zoom for clicks.
+
+`node tests/map_selection_ui.cjs` checks geometry-before-label scheduling,
+stale A→B→A responses, lazy labels and panel occlusion. These checks also run with
+`scripts/verify_research_workflow.py --ui`.
+
+## Bounded research requests
+
+Read `GET /api/research/overview` first. It reports checkpoint identity,
+calibration, implemented operations and live-validation status without loading
+inference. Implementation availability does not establish real-checkpoint
+numerical correctness. The existing memory admission, one-model lease and
+no-swap service limits still apply. An unavailable operation returns an explicit
+error; the server does not download or launch another model to satisfy it.
+
+Complete-answer scoring uses `POST /api/research/score`:
+
+```json
+{
+  "text": "Return the exact answer.",
+  "completion": " 12",
+  "chat": true,
+  "prefix": "",
+  "neurons": [],
+  "eos_policy": "exclude",
+  "timeout_seconds": 60
+}
+```
+
+This requests one arm and one exact completion. Retain separate baseline and
+intervention results for a paired comparison. Every contextual completion token
+must be scored, with token IDs, per-token and total log probabilities retained.
+An unstable prompt/completion token boundary is an error. `eos_policy` declares
+whether an end-of-sequence token is excluded or included. Sequence likelihood
+and exact parsed generation accuracy are different metrics. The legacy
+`/api/agent/logprobs` endpoint remains a next-token probe; its `first_token_only`
+warning must not be treated as a complete multi-token answer score.
+
+Single-arm greedy generation uses `POST /api/research/generate`:
+
+```json
+{
+  "messages": [{"role": "user", "content": "Reply with one digit."}],
+  "neurons": [],
+  "max_new": 32,
+  "timeout_seconds": 60
+}
+```
+
+Interventions use the existing `{ "layer": 0, "n": 0, "dose": 0.5,
+"mode": "add" }` form; an empty list requests the baseline. These endpoints
+accept at most 32 neuron interventions, 32 chat turns, a 256 KiB JSON body,
+256 generated tokens and a finite timeout of at most 300 seconds. Runtime
+context bounds can be smaller than the character limit. Unsupported fields and
+head interventions are rejected. A request deadline or disconnect signals the
+worker to stop; the serial slot remains held until the worker has actually
+finished cleanup. Opening the UI or reading overview does not launch a study.
+
+The stdio MCP bridge exposes `research_overview`, `score_sequence`,
+`generate_one`, `capture_selected`, `calibrate_research`, `research_job`,
+`intervention_preset` and `local_researcher`. The Codex panel includes these
+named tools in its Synapse-only allowlist; its existing approval mode and user
+disables remain intact. HTTP access uses the existing same-machine restriction.
+
+## Paired jobs, presets and the local researcher
+
+Open **Research** in the app to run a direct probe, submit a one-task paired job,
+choose from a fixed action menu, or save/replay/compare/compose presets. Recent
+paired jobs retain cancel/resume/status controls after a page reload. The HTTP API
+and MCP also support larger, explicitly bounded item lists. Jobs, trial outcomes,
+immutable presets and researcher episodes share `research.sqlite3` under the
+checkpoint's existing state directory. A candidate does not create a new folder.
+
+For additive research, explicitly calibrate the required layers before freezing
+an experiment, preset or researcher episode:
+
+```json
+{"layers": [0], "timeout_seconds": 120}
+```
+
+Send this to `POST /api/research/calibrate`. Calibration uses the short fixed
+reference, reports its forwards/token cost, and changes the calibration identity.
+Multiplicative edits need no residual-norm calibration. A measured additive call
+refuses a missing calibration instead of creating uncharged calibration work.
+GGUF reuses its checkpoint-separated residual-norm manifest when present.
+
+Submit an evaluator job to `POST /api/research/jobs`:
+
+```json
+{
+  "name": "Bounded paired control",
+  "mode": "generation", "split": "development", "seed": 0,
+  "items": [{"id": "task-1", "prompt": "Return 7 + 5 as a number.", "answer": "12"}],
+  "baseline": {"pushes": []},
+  "treatment": {"pushes": [[0, 3, 0.9, "mul"]]},
+  "max_new": 8,
+  "limits": {"max_requests": 2, "max_tokens": 4096, "max_wall_seconds": 120}
+}
+```
+
+Generation receives prompts without evaluator labels. Its exact-answer grader
+ignores surrounding whitespace only. `mode: "sequence_score"` instead scores
+the entire contextual answer; likelihood is not accuracy. Each job contains one
+split: `development`, `validation` or `final`. Final requires an explicit
+`candidate_frozen: true`; dataset custody remains the experimenter's responsibility.
+Only `GET /api/research/jobs/{id}/feedback` on development jobs returns proposer
+feedback. Validation/final feedback requests fail.
+
+Use `GET /api/research/jobs` and `GET /api/research/jobs/{id}` to inspect jobs;
+POST `{}` to `/{id}/cancel` or `/{id}/resume`. Resume runs only missing arms,
+preserving spent budgets, successful baselines and unknown-outcome reservations.
+After process interruption, jobs require explicit resume. The immutable spec and
+checkpoint/backend/calibration identity must match. Request-token budgets charge
+prompt plus generated/scored tokens; evaluated tokens and forwards are reported
+separately. Before a call, a whole-context token reservation must fit. Unknown
+work retains that reservation. Deadlines/cancellation are cooperative between
+forwards; an already running native forward must finish before cleanup/slot reuse.
+
+The CLI uses the existing server, never a second runtime:
+
+```bash
+.venv/bin/python scripts/run_experiment.py validate spec.json
+.venv/bin/python scripts/run_experiment.py submit spec.json --wait 30
+.venv/bin/python scripts/run_experiment.py status JOB_ID
+.venv/bin/python scripts/run_experiment.py cancel JOB_ID
+.venv/bin/python scripts/run_experiment.py resume JOB_ID --wait 30
+```
+
+`POST /api/research/presets` accepts `neurons`, optional `parents`, `label` and
+`evaluation` provenance. GET the collection, `/{id}` or `/{id}/ancestry`. POST
+`{left,right}` to `/compare`, `{ids:[...]}` to `/compose`, or `{id}` to `/replay`
+and `/restore`. Restore with `id:null` returns the baseline. Replay returns
+request-scoped pushes; it does not install persistent hooks or change weights.
+Conflicting edits and incompatible identities fail explicitly. Stored evaluations
+are caller-supplied provenance, not proof of a reproduced capability gain.
+
+Create a measured proposer through `POST /api/research/researchers`:
+
+```json
+{
+  "brief": "Choose the next intervention to test on the same target.", "seed": 0,
+  "menu": [
+    {"id": "control", "description": "Leave the target unchanged", "pushes": []},
+    {"id": "candidate", "description": "Scale a declared MLP coordinate", "pushes": [[0,3,0.9,"mul"]]}
+  ],
+  "researcher_config": {"pushes": []}, "target_config": {"pushes": []},
+  "budget": {"max_requests": 8, "max_tokens": 16384, "max_seconds": 120, "max_decisions": 4}
+}
+```
+
+POST `{"feedback":[],"timeout_seconds":120}` to
+`/api/research/researchers/{id}/choose`; GET `/{id}` for its durable journal.
+The inspected local model scores **all tokens** of each displayed action ID.
+Display order/IDs are permuted reproducibly; the menu, brief, seed and both
+configurations freeze when the episode is created. Feedback accepts only
+`{split:"development",action_id,correct,total}` summaries for that menu.
+Researcher budgets charge evaluated tokens, including prompt recomputation.
+Reservations commit before native calls; an interrupted request stays charged.
+Episode wall time includes idle/interrupted time. No automatic inference runs
+on restart. Choosing an action does not evaluate its target intervention: submit
+that action separately to the evaluator, keeping original/edited proposers on
+identical starting targets and budgets. The external Agent must not adapt the
+measured prompt/menu between decisions.
+
+## Selected activation capture and scoped edits
+
+`POST /api/research/capture` accepts `text`, `chat`, `prefix`, optional `neurons`
+and `selection: [[layer,position,neuron], ...]` (at most 4096 scalars). It captures
+MLP output-projection inputs before edits and returns a hashed reference.
+Score/generate accept `interventions` entries with `layer`, `n`, `dose`, `mode`,
+`prompt_positions` and `decode_steps`. Omitted masks select that whole phase;
+`[]` selects none. Positions refer to the rendered/tokenized prompt.
+`decode_steps[0]` is the first generated token fed back to predict the second
+output token. GGUF positions remain absolute across 64-token prefill chunks and
+cached decode. Dense backends recompute the full prefix under the same edits.
+
+For bounded clean/corrupt patching, pass
+`patches: {reference: CAPTURE_RESPONSE, target_token_ids: [...]}` to score/generate.
+Reference and target must have equal prompt token counts; the target IDs must
+match the declared target exactly. Capture hashes and checkpoint/backend/
+calibration identity are checked. Patching conflicts with steering on the same
+coordinate. Every request starts fresh; cached prefixes are never reused across
+changed interventions. This path does not assume standard attention layouts or
+implement GGUF attention-head editing.
+
 ## Checks and research records
+
+For serialized offline verification, including HTTP/client contracts and native
+CPU tensor fixtures:
+
+```bash
+.venv/bin/python scripts/verify_research_workflow.py --ui --native
+```
+
+On Linux with a user systemd session, this runs under a 1 GiB memory cap, zero
+swap and one CPU, and reports the cgroup peak/oom counters. `--ui` requires Node;
+`--native` requires already installed pinned headers/runtime and a C++ compiler.
+No checkpoint inference or downloads occur. Client checks use synthetic DOM/HTTP
+fixtures; native checks use actual GGML CPU buffers. These do not establish live
+Qwen numerical equivalence or capability gains.
+
 
 ```bash
 uv sync --extra dev

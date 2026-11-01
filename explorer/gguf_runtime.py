@@ -18,6 +18,15 @@ class GGUFRuntime(Runtime):
         super().__init__(*args, **kwargs)
         self.inspector = None
         self.research_validated = False
+        # Load the checkpoint-separated normalization manifest without inference.
+        # Research never creates calibration as an uncharged side effect.
+        path = Path(self.cache_dir) / "gguf_residual_norms.json"
+        if path.exists():
+            norms = {int(k): float(v) for k, v in json.loads(path.read_text()).items()}
+            if any(not 0 <= k < ARCH["n_layers"] or not np.isfinite(v) or v <= 0
+                   for k, v in norms.items()):
+                raise ValueError("Invalid GGUF residual calibration manifest")
+            self.resid_p50.update(norms)
 
     def inspection_bridge(self):
         """Called under self.lock. Never loads inference or takes its CPU slot."""
@@ -111,6 +120,9 @@ class GGUFRuntime(Runtime):
                 "max_expansions_per_request": 12,
             },
             "generation": "three independent greedy rows, sequential on CPU",
+            "research_execution": {"implementation_available": True, "validated": False,
+                                   "scope": "single-arm, complete scoring, selected MLP capture/edit",
+                                   "requires_bridge_symbols": ["syn_clear", "syn_eos", "syn_eval_scoped"]},
             "residual_research": {
                 "implementation_available": bool(
                     self.model is not None and hasattr(self.model.lib, "syn_research")
@@ -130,6 +142,60 @@ class GGUFRuntime(Runtime):
     def _check_heads(self, heads):
         if heads:
             raise ValueError("GGUF attention-head interventions are not implemented")
+
+    def research_identity(self):
+        return {"checkpoint": {"model_key": MODEL_KEY, "identity": IDENTITY},
+                "runtime": {"backend": "llama.cpp b11669 CPU GGUF", "implementation": "research-v1"},
+                "calibration": {"activation": self.calibration_info(),
+                                "residual_norms": {str(k): v for k, v in sorted(self.resid_p50.items())}}}
+
+    def _research_context_limit(self):
+        return 2048
+
+    def _research_normalize(self, pushes):
+        # Validate common bounded config without invoking dense torch hooks.
+        out, occupied = [], set()
+        for item in pushes:
+            if not isinstance(item, (list, tuple)) or len(item) != 4:
+                raise ValueError("Pushes are [layer, neuron, dose, mode]")
+            layer, neuron, dose, mode = item
+            if type(layer) is not int or (neuron is not None and type(neuron) is not int):
+                raise ValueError("Intervention coordinates must be integers")
+            self.validate_coordinate(layer, neuron)
+            if type(dose) not in (int, float) or not np.isfinite(dose) or abs(dose) > 100 or not isinstance(mode, str) or mode not in {"add", "mul"}:
+                raise ValueError("Research doses must be finite with magnitude <=100; mode add or mul")
+            if (layer, neuron) in occupied or (layer, None) in occupied or (neuron is None and any(p[0] == layer for p in occupied)):
+                raise ValueError("Conflicting intervention coordinates")
+            occupied.add((layer, neuron))
+            if mode == "add" and dose != 0 and layer not in self.resid_p50:
+                raise ValueError("Additive research requires explicit calibration first; use /api/research/calibrate")
+            out.extend(self._pushes([item]))
+        return out
+
+    def _research_input(self, full_ids, reset):
+        return (full_ids, 0) if reset else ([full_ids[-1]], len(full_ids) - 1)
+
+    def research_token_bound(self, operation, **request):
+        # Cached decode evaluates each consumed token once per request.
+        return 2048
+
+    def _research_eval(self, ids, *, reset, pushes, edits, capture, position_offset=0):
+        if not hasattr(self.model.lib, "syn_clear"):
+            raise RuntimeError("Research calls require a rebuilt bridge with explicit memory clear")
+        if edits or capture:
+            return self.model.run_scoped(ids, reset=reset, pushes=pushes, edits=edits,
+                                         capture=capture, position_offset=position_offset)
+        return self.model.run(ids, reset=reset, pushes=pushes)[0], []
+
+    def _research_clear(self):
+        super()._research_clear()
+        self.model.clear()
+
+    def _research_eos(self):
+        return self.model.eos_token_id
+
+    def _research_is_eog(self, token):
+        return bool(self.model.lib.syn_eog(self.model.handle, token))
 
     def _ids(self, text, chat):
         ids = self.chat_ids(text) if chat else self.tok(text).input_ids
@@ -391,8 +457,8 @@ class GGUFRuntime(Runtime):
                         logits = self.model.run([token], reset=False, pushes=ps)[0]
         yield None, None
 
-    def lens(self, layer, n, k=16):
-        return self.lens_many([(layer, n)], k)[(layer, n)]
+    def lens(self, layer, n, k=16, *, cancel=None):
+        return self.lens_many([(layer, n)], k, cancel=cancel)[(layer, n)]
 
     def _cached(self, key):
         with self._db_lock:
@@ -408,7 +474,7 @@ class GGUFRuntime(Runtime):
             )
             self._db.commit()
 
-    def lens_many(self, coordinates, k=16):
+    def lens_many(self, coordinates, k=16, *, cancel=None):
         coords = list(dict.fromkeys(coordinates))
         if not 1 <= k <= 32 or len(coords) > 128:
             raise ValueError("Request at most 128 lens directions and 1..32 tokens")
@@ -426,6 +492,8 @@ class GGUFRuntime(Runtime):
                 else:
                     result[coord] = row
             if missing:
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError("Inspection canceled")
                 weights = self.inspection_bridge()
                 tok = Tokenizer(weights)
                 # Stream the unembedding once for a batch of directions. No full
@@ -450,6 +518,8 @@ class GGUFRuntime(Runtime):
                     for side in ("up", "down")
                 }
                 for start in range(0, weights.vocab, 1024):
+                    if cancel is not None and cancel.is_set():
+                        raise RuntimeError("Inspection canceled")
                     rows = torch.from_numpy(
                         weights.weight_rows(
                             "output.weight", start, min(1024, weights.vocab - start)
@@ -482,12 +552,14 @@ class GGUFRuntime(Runtime):
                 for coord, row in result.items()
             }
 
-    def connections(self, layer, n, k=24, lens_k=5):
+    def connections(self, layer, n, k=24, lens_k=5, *, cancel=None):
         self.validate_coordinate(layer, n)
         if not 1 <= k <= 64 or not 0 <= lens_k <= 32:
             raise ValueError("Request 1..64 connections and 0..32 lens tokens")
         key = f"gguf-links-v1:{layer}:{n}"
         with self.lock:
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("Inspection canceled")
             data = self._cached(key)
             cached = data is not None
             if data is None:
@@ -510,8 +582,9 @@ class GGUFRuntime(Runtime):
             }
             if lens_k:
                 neighbors = out["up"] + out["down"]
+                kwargs = {"cancel": cancel} if cancel is not None else {}
                 lenses = self.lens_many(
-                    [(c["layer"], c["n"]) for c in neighbors], lens_k
+                    [(c["layer"], c["n"]) for c in neighbors], lens_k, **kwargs
                 )
                 for c in neighbors:
                     label = lenses[(c["layer"], c["n"])]
@@ -544,13 +617,13 @@ class GGUFRuntime(Runtime):
             cap,
         )
 
-    def connection_summary(self, layer, n, first=5, k=2, hops=1, top=24):
+    def connection_summary(self, layer, n, first=5, k=2, hops=1, top=24, *, cancel=None):
         graph = self.connection_graph(layer, n, first, k, hops)
         reach = reached_nodes(graph["links"], layer, n)
         # Label the strongest 64 reached nodes; report the scope rather than
         # inventing corpus-frequency/layerwise-lift statistics without an index.
         selected = sorted(reach, key=lambda c: (abs(reach[c][0]), -reach[c][1], c))[:64]
-        lens = self.lens_many(selected, 8)
+        lens = self.lens_many(selected, 8, cancel=cancel)
         zmax = max((v[1] for v in reach.values()), default=1.0) or 1.0
 
         def pool(nodes, flip):

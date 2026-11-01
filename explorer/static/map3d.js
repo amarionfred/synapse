@@ -495,10 +495,15 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       selected = layer == null ? null : { layer, n };
       connections = [];
       refreshHighlights();
-      if (!fly || layer == null || layerMode !== null) return;
-      // off screen (or behind the camera): fly to it, never zooming out from where the user is
+      if (layer == null || layerMode !== null) return;
+      // Panels occupy part of the canvas. A point can be inside the camera's
+      // frustum while hidden under a panel that opened with this selection.
       const v = neuronPos(layer, n).project(camera);
-      if (v.z > 1 || Math.abs(v.x) > 0.9 || Math.abs(v.y) > 0.9) flyTo(neuronPos(layer, n), Math.min(curDist(), homeDist * 0.35));
+      const w = canvas.clientWidth, narrow = w <= 760;
+      const left = narrow ? 0 : insets.left, right = narrow ? 0 : insets.right;
+      const x = (v.x + 1) * w / 2;
+      if (v.z > 1 || x < left + 24 || x > w - right - 24 || Math.abs(v.y) > 0.9)
+        flyTo(neuronPos(layer, n), fly ? Math.min(curDist(), homeDist * 0.35) : curDist());
     },
     setConnections(con) {
       connections = [...con.down.map(c => ({ ...c, side: "down" })), ...con.up.map(c => ({ ...c, side: "up" }))];

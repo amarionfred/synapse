@@ -11,7 +11,9 @@ import uuid
 
 EXPLORER_TOOLS = ["overview", "neuron", "rollouts", "cone", "web_summary", "search_lens", "top_units", "set_name",
                   "names", "steer", "activations", "compare", "logprobs", "top_firing", "select_neuron",
-                  "highlight_neurons", "show_text", "show_search", "camera", "annotate_neurons", "open_tab"]
+                  "highlight_neurons", "show_text", "show_search", "camera", "annotate_neurons", "open_tab",
+                  "research_overview", "score_sequence", "generate_one", "capture_selected", "calibrate_research",
+                  "research_job", "intervention_preset", "local_researcher"]
 
 
 def command(root, port, chat, model=None, thread=None):

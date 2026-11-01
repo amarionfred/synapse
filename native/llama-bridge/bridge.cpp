@@ -21,6 +21,23 @@ struct Push {
   int layer, neuron, mode;
   float value;
 }; // mode 0 add, 1 multiply
+struct ScopedPush {
+  int layer, neuron, mode;
+  float value;
+  int position;
+}; // absolute processed position; mode 0 add, 1 multiply, 2 replace
+struct Selected {
+  int layer, position, neuron;
+};
+struct Scoped {
+  int position_offset = 0;
+  const ScopedPush *edits = nullptr;
+  int n_edits = 0;
+  const Selected *selected = nullptr;
+  int n_selected = 0;
+  float *values = nullptr;
+  std::vector<int> edit_visits, capture_visits;
+};
 struct Research {
   int layer = -1, token = -1, captured = 0;
   const float *direction = nullptr;
@@ -46,6 +63,7 @@ struct Engine {
   const Push *pushes = nullptr;
   int n_push = 0;
   Research *research = nullptr; // stack-owned, cleared on every exit
+  Scoped *scoped = nullptr; // stack-owned; independent of residual research
   std::vector<int> visits, resid_visits;
   std::string failure;
   // Inspection streams read-only file pages. Drop this mapping's resident pages
@@ -153,7 +171,14 @@ static bool callback(ggml_tensor *t, bool ask, void *user) {
   bool push = false;
   for (int i = 0; act && i < e.n_push; ++i)
     push |= e.pushes[i].layer == layer;
-  bool wanted = act && (e.full || e.read_layer == layer || push || e.observing);
+  bool scoped = false;
+  if (act && e.scoped) {
+    for (int i = 0; i < e.scoped->n_edits; ++i)
+      scoped |= e.scoped->edits[i].layer == layer;
+    for (int i = 0; i < e.scoped->n_selected; ++i)
+      scoped |= e.scoped->selected[i].layer == layer;
+  }
+  bool wanted = act && (e.full || e.read_layer == layer || push || scoped || e.observing);
   wanted |= resid && e.residuals;
   wanted |= resid && e.research && e.research->layer == layer;
   wanted |= writer >= 0;
@@ -181,6 +206,20 @@ static bool callback(ggml_tensor *t, bool ask, void *user) {
       else if (e.acts && layer == e.read_layer)
         for (int j = 0; j < tokens; ++j)
           e.acts[e.offset + j] = buf[size_t(j) * width + e.read_neuron];
+      // Capture the unmodified MLP input, then apply global and selected edits.
+      if (e.scoped) {
+        auto &s = *e.scoped;
+        for (int i = 0; i < s.n_selected; ++i) {
+          const auto &p = s.selected[i];
+          int j = p.position - s.position_offset - e.offset;
+          if (p.layer == layer && j >= 0 && j < tokens) {
+            float v = buf[size_t(j) * width + p.neuron];
+            if (++s.capture_visits[i] != 1 || !std::isfinite(v))
+              throw std::runtime_error("Duplicate or nonfinite selected activation");
+            s.values[i] = v;
+          }
+        }
+      }
       if (push) {
         for (int i = 0; i < e.n_push; ++i)
           if (e.pushes[i].layer == layer) {
@@ -194,8 +233,30 @@ static bool callback(ggml_tensor *t, bool ask, void *user) {
               }
             }
           }
-        ggml_backend_tensor_set(t, buf.data(), 0, buf.size() * sizeof(float));
       }
+      bool edited = false;
+      if (e.scoped) {
+        auto &s = *e.scoped;
+        for (int i = 0; i < s.n_edits; ++i) {
+          const auto &p = s.edits[i];
+          int j = p.position - s.position_offset - e.offset;
+          if (p.layer != layer || j < 0 || j >= tokens)
+            continue;
+          if (++s.edit_visits[i] != 1)
+            throw std::runtime_error("Duplicate scoped intervention callback");
+          int begin = p.neuron < 0 ? 0 : p.neuron;
+          int end = p.neuron < 0 ? width : p.neuron + 1;
+          for (int n = begin; n < end; ++n) {
+            float &v = buf[size_t(j) * width + n];
+            v = p.mode == 2 ? p.value : p.mode == 1 ? v * p.value : v + p.value;
+            if (!std::isfinite(v))
+              throw std::runtime_error("Nonfinite scoped intervention output");
+          }
+          edited = true;
+        }
+      }
+      if (push || edited)
+        ggml_backend_tensor_set(t, buf.data(), 0, buf.size() * sizeof(float));
     } else if (resid) {
       e.resid_visits[layer] += tokens;
       for (int j = 0; e.residuals && j < tokens; ++j) {
@@ -364,6 +425,22 @@ bool syn_eog(void *ptr, int token) {
   return llama_vocab_is_eog(
       llama_model_get_vocab(static_cast<Engine *>(ptr)->model), token);
 }
+int syn_eos(void *ptr) {
+  return llama_vocab_eos(llama_model_get_vocab(static_cast<Engine *>(ptr)->model));
+}
+int syn_clear(void *ptr) {
+  auto &e = *static_cast<Engine *>(ptr);
+  e.pushes = nullptr;
+  e.n_push = 0;
+  e.acts = e.residuals = nullptr;
+  e.research = nullptr;
+  e.scoped = nullptr;
+  e.full = e.observing = false;
+  e.read_layer = e.read_neuron = -1;
+  if (e.ctx)
+    llama_memory_clear(llama_get_memory(e.ctx), true);
+  return 0;
+}
 int syn_eval(void *ptr, int *ids, int count, bool reset, bool observe,
              bool full, int layer, int neuron, const Push *pushes, int n_push,
              float *acts, float *residuals, float *logits) {
@@ -373,6 +450,8 @@ int syn_eval(void *ptr, int *ids, int count, bool reset, bool observe,
       throw std::runtime_error("Weight-only inspection has no inference context");
     if (count < 1 || count > 2048)
       throw std::runtime_error("Probe needs 1..2048 tokens");
+    if (!ids || !logits || n_push < 0 || n_push > 128 || (n_push && !pushes))
+      throw std::runtime_error("Invalid evaluation buffers or intervention count");
     if (acts && !full &&
         (layer < 0 || layer >= e.layers || neuron < 0 || neuron >= e.inter))
       throw std::runtime_error("Invalid read coordinate");
@@ -404,7 +483,7 @@ int syn_eval(void *ptr, int *ids, int count, bool reset, bool observe,
       // All logits preserve all token rows even in the last layer during
       // inspection.
       std::vector<int8_t> outputs(n, 1);
-      if (acts || residuals || observe || e.research)
+      if (acts || residuals || observe || e.research || e.scoped)
         batch.logits = outputs.data();
       int rc = llama_decode(e.ctx, batch);
       if (!e.failure.empty())
@@ -432,6 +511,14 @@ int syn_eval(void *ptr, int *ids, int count, bool reset, bool observe,
             throw std::runtime_error("Missing or duplicate residual writer at slot " +
                                      std::to_string(slot));
     }
+    if (e.scoped) {
+      for (int n : e.scoped->edit_visits)
+        if (n != 1)
+          throw std::runtime_error("Scoped intervention did not execute exactly once");
+      for (int n : e.scoped->capture_visits)
+        if (n != 1)
+          throw std::runtime_error("Selected activation did not execute exactly once");
+    }
     memcpy(logits, llama_get_logits_ith(e.ctx, -1),
            size_t(e.vocab) * sizeof(float));
     e.pushes = nullptr;
@@ -443,6 +530,55 @@ int syn_eval(void *ptr, int *ids, int count, bool reset, bool observe,
     e.pushes = nullptr;
     e.n_push = 0;
     e.acts = e.residuals = nullptr;
+    if (e.ctx)
+      llama_memory_clear(llama_get_memory(e.ctx), true);
+    return -1;
+  }
+}
+// Separate ABI preserves ordinary probes. Positions include the cached prefix;
+// no caller may reuse that prefix after changing its interventions.
+int syn_eval_scoped(void *ptr, int *ids, int count, bool reset, int position_offset,
+                    const Push *pushes, int n_push,
+                    const ScopedPush *edits, int n_edits,
+                    const Selected *selected, int n_selected,
+                    float *values, float *logits) {
+  auto &e = *static_cast<Engine *>(ptr);
+  Scoped s;
+  struct Clear { Engine &e; ~Clear() { e.scoped = nullptr; } } clear{e};
+  try {
+    if (count < 1 || count > 2048 || position_offset < 0 ||
+        position_offset > 2048 - count || (reset && position_offset != 0) ||
+        n_edits < 0 || n_edits > 4096 || n_selected < 0 || n_selected > 4096 ||
+        (n_edits && !edits) || (n_selected && (!selected || !values)))
+      throw std::runtime_error("Invalid bounded scoped request");
+    auto coordinate = [&](int layer, int neuron, int position, bool whole) {
+      if (layer < 0 || layer >= e.layers || neuron < (whole ? -1 : 0) ||
+          neuron >= e.inter || position < position_offset ||
+          position >= position_offset + count)
+        throw std::runtime_error("Invalid scoped coordinate");
+    };
+    for (int i = 0; i < n_edits; ++i) {
+      const auto &p = edits[i];
+      coordinate(p.layer, p.neuron, p.position, true);
+      if (p.mode < 0 || p.mode > 2 || (p.neuron == -1 && p.mode != 1) ||
+          !std::isfinite(p.value))
+        throw std::runtime_error("Invalid scoped edit");
+    }
+    for (int i = 0; i < n_selected; ++i)
+      coordinate(selected[i].layer, selected[i].neuron, selected[i].position, false);
+    s.position_offset = position_offset;
+    s.edits = edits;
+    s.n_edits = n_edits;
+    s.selected = selected;
+    s.n_selected = n_selected;
+    s.values = values;
+    s.edit_visits.assign(n_edits, 0);
+    s.capture_visits.assign(n_selected, 0);
+    e.scoped = &s;
+    return syn_eval(ptr, ids, count, reset, false, false, -1, -1,
+                    pushes, n_push, nullptr, nullptr, logits);
+  } catch (const std::exception &ex) {
+    error = ex.what();
     if (e.ctx)
       llama_memory_clear(llama_get_memory(e.ctx), true);
     return -1;

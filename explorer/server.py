@@ -6,9 +6,11 @@ import asyncio
 import builtins
 import glob
 import json
+import math
 import os
 import sys
 import threading
+import time
 
 import numpy as np
 import uvicorn
@@ -64,9 +66,12 @@ async def no_store(request, call_next):
 
 rt = Runtime(STATS)
 _cache = {}
+_research_runner = None
+_research_runner_lock = threading.Lock()
+_researchers = None
 
 
-async def inspection_call(request, operation, *args):
+async def inspection_call(request, operation, *args, cancelable=False):
     """Do not put abandoned selections into the native runtime's thread queue.
 
     An already running bounded scan finishes and can populate the cache. Hold
@@ -78,11 +83,21 @@ async def inspection_call(request, operation, *args):
     gate = request.app.state.inspection_gate
     await gate.acquire()
     work = None
+    cancel = threading.Event()
     try:
         if await request.is_disconnected():
             raise HTTPException(499, "Selection request disconnected")
-        work = asyncio.create_task(asyncio.to_thread(operation, *args))
+        kwargs = {"cancel": cancel} if cancelable else {}
+        work = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+        if cancelable:
+            while not work.done():
+                await asyncio.wait({work}, timeout=.05)
+                if await request.is_disconnected():
+                    cancel.set()
         return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        cancel.set()
+        raise
     finally:
         if work is None or work.done():
             gate.release()
@@ -246,7 +261,17 @@ def rollout(layer: int, i: int):
 
 @app.get("/api/connections")
 async def connections(layer: int, n: int, k: int = 24, lens: int = 5, request: Request = None):
-    out = await inspection_call(request, rt.connections, layer, n, k, lens)
+    if not 1 <= k <= 64 or not 0 <= lens <= 32:
+        raise ValueError("Request 1..64 connections and 0..32 lens tokens")
+    out = None
+    if lens == 0 and callable(getattr(rt, "cached_connections", None)):
+        cached = await asyncio.to_thread(rt.cached_connections, layer, n, k)
+        if not cached.get("pending"):
+            out = {**cached, "cached": True}
+    if out is None:
+        out = await inspection_call(request, rt.connections, layer, n, k, lens, cancelable=GGUF)
+    if lens == 0:
+        return out
     words = await asyncio.to_thread(lambda: {l: ranked_words(l) for l in {c["layer"] for c in out["down"] + out["up"]}})
     nm = names()
     out = {**out, **{side: [dict(c) for c in out[side]] for side in ("down", "up")}}
@@ -266,7 +291,7 @@ async def hover(layer: int, n: int):
 
 @app.get("/api/lens")
 async def lens(layer: int, n: int, request: Request):
-    return await inspection_call(request, rt.lens, layer, n, 12)
+    return await inspection_call(request, rt.lens, layer, n, 12, cancelable=GGUF)
 
 
 @app.post("/api/reads")
@@ -577,10 +602,10 @@ _idf = {}
 
 @app.get("/api/web/summary")
 async def web_summary_request(request: Request, layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, src: str = "steer", hops: int = 0):
-    return await inspection_call(request, web_summary, layer, n, first, k, top, src, hops)
+    return await inspection_call(request, web_summary, layer, n, first, k, top, src, hops, cancelable=GGUF)
 
 
-def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, src: str = "steer", hops: int = 0):
+def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, src: str = "steer", hops: int = 0, *, cancel=None):
     """What the neuron's web says, in tokens. Each neuron in the cone is read on the pole the chain drives (signs
     multiplied along the path from the open neuron), and its steer (or logit) lens tokens are pooled, merged across
     case and leading space, and weighted by link z / max z times 0.8 per hop past the first, times log lift: the share
@@ -590,7 +615,8 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
     `toward` (the driven pole) and `away` (the opposite pole); upstream gives `fed_by` (the pole that excites it) and
     `held_by` (the pole that inhibits it)."""
     if hasattr(rt, "connection_summary"):
-        return rt.connection_summary(layer,n,first,k,hops or 1,builtins.min(100,top))
+        kwargs = {"cancel": cancel} if cancel is not None else {}
+        return rt.connection_summary(layer,n,first,k,hops or 1,builtins.min(100,top),**kwargs)
     st = rt.steer_index() if src == "steer" else None
     lens = st if st is not None else rt.lens_index()
     if lens is None or rt.con_index() is None:
@@ -744,6 +770,354 @@ def _live_off():
     if NO_MODEL:
         return {"error": "the live model is off (server started with EXPLORER_NO_MODEL=1); suggest the test instead"}
     return None
+
+
+RESEARCH_LIMITS = {"request_bytes": 256 * 1024, "max_new": 256, "timeout_seconds": 300}
+
+
+async def _research_body(request, allowed):
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > RESEARCH_LIMITS["request_bytes"]:
+            raise ValueError("Research request exceeds 256 KiB")
+        raw.extend(chunk)
+    try:
+        body = json.loads(raw)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise ValueError("Research request must contain valid JSON") from exc
+    if not isinstance(body, dict):
+        raise ValueError("Research request must be an object")
+    if allowed is not None and (unknown := body.keys() - allowed):
+        raise ValueError(f"Unknown research fields: {', '.join(sorted(unknown))}")
+    return body
+
+
+def _research_text(body, key, default=None, *, empty=False):
+    value = body.get(key, default)
+    if not isinstance(value, str) or (not empty and not value) or len(value) > 32768:
+        raise ValueError(f"{key} must be {'a' if empty else 'a nonempty'} string of at most 32768 characters")
+    return value
+
+
+def _research_finite(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _research_timeout(body):
+    value = body.get("timeout_seconds", 60)
+    if not _research_finite(value) or not 0 < value <= RESEARCH_LIMITS["timeout_seconds"]:
+        raise ValueError("timeout_seconds must be finite, greater than zero and at most 300")
+    return float(value)
+
+
+def _research_pushes(body):
+    items = body.get("neurons", [])
+    if not isinstance(items, list) or len(items) > 32:
+        raise ValueError("neurons must be a list of at most 32 interventions")
+    pushes = []
+    for item in items:
+        if not isinstance(item, dict) or item.keys() - {"layer", "n", "dose", "mode"}:
+            raise ValueError("Each neuron requires layer, n and optional dose/mode")
+        layer, neuron = item.get("layer"), item.get("n")
+        if (type(layer) is not int or not 0 <= layer < ARCH["n_layers"] or "n" not in item
+                or (neuron is not None and (type(neuron) is not int or not 0 <= neuron < ARCH["inter"]))):
+            raise ValueError("Neuron coordinates are outside this checkpoint")
+        dose, mode = item.get("dose", 0.8), item.get("mode", "add")
+        if (not _research_finite(dose) or abs(dose) > 100 or not isinstance(mode, str)
+                or mode not in {"add", "mul"} or (neuron is None and mode != "mul")):
+            raise ValueError("Use a finite neuron dose and mode add or mul")
+        pushes.append((layer, neuron, float(dose), mode))
+    return pushes
+
+
+async def _research_call(request, operation, *args, timeout, **kwargs):
+    """Keep the serial slot until the worker acknowledges cancellation and cleans up."""
+    if NO_MODEL:
+        raise RuntimeError("Live model disabled; research execution requires an admitted runtime")
+    if not callable(operation):
+        raise RuntimeError("This research operation is unavailable in the current runtime")
+    deadline, cancel = time.monotonic() + timeout, threading.Event()
+    gate = request.app.state.research_gate
+    try:
+        await asyncio.wait_for(gate.acquire(), timeout=timeout)
+    except TimeoutError as exc:
+        raise HTTPException(408, "Research deadline expired while waiting for the worker") from exc
+    work = None
+    try:
+        if await request.is_disconnected():
+            raise HTTPException(499, "Research request disconnected")
+        work = asyncio.create_task(asyncio.to_thread(operation, *args, cancel=cancel, deadline=deadline, **kwargs))
+        if not hasattr(request.app.state, "research_pending"):
+            request.app.state.research_pending = {}
+        pending = request.app.state.research_pending
+        pending[work] = cancel
+        work.add_done_callback(lambda task: pending.pop(task, None))
+        while not work.done():
+            await asyncio.wait({work}, timeout=0.05)
+            if time.monotonic() >= deadline or await request.is_disconnected():
+                cancel.set()
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        cancel.set()
+        raise
+    finally:
+        if work is None or work.done():
+            gate.release()
+        else:
+            def finished(task):
+                if not task.cancelled():
+                    task.exception()
+                gate.release()
+            work.add_done_callback(finished)
+
+
+@app.get("/api/research/overview")
+def research_overview():
+    capabilities = rt.capabilities()
+    identity_available = callable(getattr(rt, "research_identity", None))
+    return {"model_key": MODEL_KEY, "identity": IDENTITY, "runtime": capabilities,
+            "calibration": rt.calibration_info(), "live_model_enabled": not NO_MODEL,
+            "operations": {"score": callable(getattr(rt, "score_sequence", None)),
+                           "generate": callable(getattr(rt, "generate_one", None)),
+                           "capture": callable(getattr(rt, "capture_selected", None)),
+                           "calibrate": callable(getattr(rt, "calibrate_research", None)),
+                           "researcher": identity_available and callable(getattr(rt, "score_sequence", None)),
+                           "jobs": identity_available and callable(getattr(rt, "score_sequence", None))
+                                   and callable(getattr(rt, "generate_one", None)),
+                           "presets": identity_available},
+            "limits": RESEARCH_LIMITS,
+            "researcher": {"kind": "inspected-local-model", "external_agent": False},
+            "live_validation": capabilities.get("research_execution", {"validated": False})}
+
+
+def _research_scopes(body):
+    scopes = {}
+    if "interventions" in body:
+        items = body["interventions"]
+        if not isinstance(items, list) or len(items) > 128 or any(not isinstance(p, dict) for p in items):
+            raise ValueError("interventions must contain at most 128 scoped MLP edits")
+        scopes["interventions"] = items
+    if "patches" in body:
+        if not isinstance(body["patches"], dict):
+            raise ValueError("patches must contain a matched reference and target_token_ids")
+        scopes["patches"] = body["patches"]
+    return scopes
+
+
+@app.post("/api/research/score")
+async def research_score(request: Request):
+    body = await _research_body(request, {"text", "completion", "chat", "prefix", "neurons",
+                                          "eos_policy", "timeout_seconds", "interventions", "patches"})
+    text = _research_text(body, "text")
+    completion = _research_text(body, "completion")
+    prefix = _research_text(body, "prefix", "", empty=True)
+    chat = body.get("chat", True)
+    if type(chat) is not bool:
+        raise ValueError("chat must be a boolean")
+    eos_policy = body.get("eos_policy", "exclude")
+    if not isinstance(eos_policy, str) or eos_policy not in {"exclude", "include"}:
+        raise ValueError("eos_policy must be exclude or include")
+    return await _research_call(request, getattr(rt, "score_sequence", None), text, completion,
+                                chat=chat, prefix=prefix, pushes=_research_pushes(body),
+                                eos_policy=eos_policy, timeout=_research_timeout(body), **_research_scopes(body))
+
+
+@app.post("/api/research/generate")
+async def research_generate(request: Request):
+    body = await _research_body(request, {"messages", "neurons", "max_new", "timeout_seconds", "interventions", "patches"})
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not 1 <= len(messages) <= 32:
+        raise ValueError("messages must contain 1..32 user, assistant or system turns")
+    for message in messages:
+        if (not isinstance(message, dict) or message.keys() != {"role", "content"}
+                or not isinstance(message.get("role"), str)
+                or message["role"] not in {"user", "assistant", "system"}):
+            raise ValueError("Each message requires only role and content")
+        _research_text(message, "content")
+    max_new = body.get("max_new", 32)
+    if type(max_new) is not int or not 1 <= max_new <= RESEARCH_LIMITS["max_new"]:
+        raise ValueError("max_new must be an integer in 1..256")
+    return await _research_call(request, getattr(rt, "generate_one", None), messages,
+                                pushes=_research_pushes(body), max_new=max_new,
+                                timeout=_research_timeout(body), **_research_scopes(body))
+
+
+@app.post("/api/research/capture")
+async def research_capture(request: Request):
+    body = await _research_body(request, {"text", "selection", "chat", "prefix", "neurons", "timeout_seconds"})
+    selection = body.get("selection")
+    if not isinstance(selection, list) or not 1 <= len(selection) <= 4096:
+        raise ValueError("selection must contain 1..4096 [layer,position,neuron] coordinates")
+    return await _research_call(request, getattr(rt, "capture_selected", None),
+                                _research_text(body, "text"), selection,
+                                chat=body.get("chat", True), prefix=_research_text(body, "prefix", "", empty=True),
+                                pushes=_research_pushes(body), timeout=_research_timeout(body))
+
+
+@app.post("/api/research/calibrate")
+async def research_calibrate(request: Request):
+    body = await _research_body(request, {"layers", "timeout_seconds"})
+    return await _research_call(request, getattr(rt, "calibrate_research", None), body.get("layers"),
+                                timeout=_research_timeout(body))
+
+
+def _researcher_call(method, *args, **kwargs):
+    global _researchers
+    with _research_runner_lock:
+        if _researchers is None:
+            from local_researcher import ResearcherStore
+            _researchers = ResearcherStore(rt, STATE)
+    try:
+        return getattr(_researchers, method)(*args, **kwargs)
+    except KeyError as exc:
+        raise HTTPException(404, "Local researcher episode not found") from exc
+
+
+@app.post("/api/research/researchers", status_code=201)
+async def research_create_researcher(request: Request):
+    body = await _research_body(request, None)
+    return await asyncio.to_thread(_researcher_call, "create", body)
+
+
+@app.get("/api/research/researchers/{episode_id}")
+async def research_get_researcher(episode_id: str):
+    return await asyncio.to_thread(_researcher_call, "get", episode_id)
+
+
+@app.post("/api/research/researchers/{episode_id}/choose")
+async def research_choose(episode_id: str, request: Request):
+    body = await _research_body(request, {"feedback", "timeout_seconds"})
+    return await _research_call(request, lambda **kw: _researcher_call("run", episode_id,
+                                body.get("feedback", []), **kw), timeout=_research_timeout(body))
+
+
+def _get_research_runner():
+    """One serial worker and store, reusing the process's existing model runtime."""
+    global _research_runner
+    with _research_runner_lock:
+        if _research_runner is None:
+            if not callable(getattr(rt, "research_identity", None)):
+                raise RuntimeError("Research jobs are unavailable in the current runtime")
+            from experiment_runner import ExperimentRunner
+            _research_runner = ExperimentRunner(rt, STATE)
+        return _research_runner
+
+
+def _research_job_call(method, *args, **kwargs):
+    runner = _get_research_runner()
+    operation = getattr(runner, method, None)
+    if not callable(operation):
+        raise RuntimeError("This job operation is unavailable in the current implementation")
+    try:
+        return operation(*args, **kwargs)
+    except KeyError as exc:
+        raise HTTPException(404, "Research job not found") from exc
+
+
+@app.get("/api/research/jobs")
+async def research_jobs(limit: int = 100):
+    return {"items": await asyncio.to_thread(_research_job_call, "list", limit=limit)}
+
+
+@app.post("/api/research/jobs", status_code=202)
+async def research_submit(request: Request):
+    body = await _research_body(request, None)
+    if NO_MODEL:
+        raise RuntimeError("Live model disabled; research execution requires an admitted runtime")
+    return await asyncio.to_thread(_research_job_call, "submit", body)
+
+
+@app.get("/api/research/jobs/{job_id}")
+async def research_job_status(job_id: str):
+    return await asyncio.to_thread(_research_job_call, "status", job_id)
+
+
+@app.get("/api/research/jobs/{job_id}/feedback")
+async def research_job_feedback(job_id: str):
+    return await asyncio.to_thread(_research_job_call, "feedback", job_id)
+
+
+@app.post("/api/research/jobs/{job_id}/cancel")
+async def research_cancel(job_id: str, request: Request):
+    await _research_body(request, set())
+    return await asyncio.to_thread(_research_job_call, "cancel", job_id)
+
+
+@app.post("/api/research/jobs/{job_id}/resume")
+async def research_resume(job_id: str, request: Request):
+    await _research_body(request, set())
+    if NO_MODEL:
+        raise RuntimeError("Live model disabled; research execution requires an admitted runtime")
+    return await asyncio.to_thread(_research_job_call, "resume", job_id)
+
+
+def _research_preset_call(method, *args, **kwargs):
+    identity = getattr(rt, "research_identity", None)
+    if not callable(identity):
+        raise RuntimeError("Research presets are unavailable in the current runtime")
+    from presets import PresetStore
+    store = PresetStore(STATE, identity())
+    try:
+        return getattr(store, method)(*args, **kwargs)
+    except KeyError as exc:
+        raise HTTPException(404, "Intervention preset not found") from exc
+    finally:
+        store.close()
+
+
+@app.get("/api/research/presets")
+async def research_presets(limit: int = 100):
+    return {"items": await asyncio.to_thread(_research_preset_call, "list", limit=limit)}
+
+
+@app.post("/api/research/presets", status_code=201)
+async def research_save_preset(request: Request):
+    body = await _research_body(request, {"neurons", "parents", "evaluation", "label"})
+    return await asyncio.to_thread(_research_preset_call, "save", _research_pushes(body),
+                                   parents=body.get("parents", []), evaluation=body.get("evaluation"),
+                                   label=body.get("label", ""))
+
+
+@app.get("/api/research/presets/{preset_id}")
+async def research_get_preset(preset_id: str):
+    return await asyncio.to_thread(_research_preset_call, "get", preset_id)
+
+
+@app.get("/api/research/presets/{preset_id}/ancestry")
+async def research_preset_ancestry(preset_id: str):
+    return {"items": await asyncio.to_thread(_research_preset_call, "ancestry", preset_id)}
+
+
+@app.post("/api/research/presets/compare")
+async def research_compare_presets(request: Request):
+    body = await _research_body(request, {"left", "right"})
+    left, right = (_research_text(body, key) for key in ("left", "right"))
+    return await asyncio.to_thread(_research_preset_call, "compare", left, right)
+
+
+@app.post("/api/research/presets/compose", status_code=201)
+async def research_compose_presets(request: Request):
+    body = await _research_body(request, {"ids", "evaluation", "label"})
+    return await asyncio.to_thread(_research_preset_call, "compose", body.get("ids"),
+                                   evaluation=body.get("evaluation"), label=body.get("label", ""))
+
+
+@app.post("/api/research/presets/replay")
+async def research_replay_preset(request: Request):
+    body = await _research_body(request, {"id"})
+    return await asyncio.to_thread(_research_preset_call, "replay", _research_text(body, "id"))
+
+
+@app.post("/api/research/presets/restore")
+async def research_restore_preset(request: Request):
+    body = await _research_body(request, {"id"})
+    preset_id = body.get("id")
+    if preset_id is not None and not isinstance(preset_id, str):
+        raise ValueError("id must be a preset ID or null for the baseline")
+    return await asyncio.to_thread(_research_preset_call, "restore", preset_id)
 
 
 @app.post("/api/agent/steer")
@@ -1223,6 +1597,8 @@ app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), h
 @app.on_event("startup")
 def preload():
     app.state.inspection_gate = asyncio.Lock()
+    app.state.research_gate = asyncio.Lock()
+    app.state.research_pending = {}
     def go():
         if NO_MODEL:
             rt.status = "cache only"
@@ -1235,6 +1611,27 @@ def preload():
                 import traceback
                 traceback.print_exc()
     threading.Thread(target=go, daemon=True).start()
+
+
+@app.on_event("shutdown")
+async def stop_research_worker():
+    global _research_runner, _researchers
+    pending = getattr(app.state, "research_pending", {})
+    for cancel in list(pending.values()):
+        cancel.set()
+    if pending:
+        try:
+            await asyncio.wait_for(asyncio.gather(*(asyncio.shield(task) for task in list(pending)),
+                                                 return_exceptions=True), timeout=30)
+        except TimeoutError as exc:
+            raise RuntimeError("Direct research worker has not acknowledged cleanup; store remains open") from exc
+    if _research_runner is not None:
+        if await asyncio.to_thread(_research_runner.shutdown) is False:
+            raise RuntimeError("Research worker did not acknowledge cleanup; runner ownership is retained")
+        _research_runner = None
+    if _researchers is not None:
+        _researchers.close()
+        _researchers = None
 
 
 if __name__ == "__main__":

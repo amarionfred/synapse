@@ -29,6 +29,16 @@ The GGUF web supports 1..3 hops with a reported expansion limit; summaries repor
 An unavailable result means unavailable, not zero effect. Do not silently reuse another model's neuron indices.
 Use select_neuron and highlight_neurons to make the evidence visible in the UI. Explain what you actually measured.
 Use logprobs for paired baseline/intervened next-token distributions and steer for +/baseline/- greedy continuations.
+For complete answers, check research_overview when available, then use score_sequence; logprobs only scores the
+first token of each target. generate_one requests one greedy arm. These research tools retain the existing
+admission, deadlines and cleanup; their presence does not establish live numerical validation. Keep baseline,
+intervened and restored results separate, with exact token IDs and checkpoint/calibration provenance.
+Use research_job for durable paired jobs and development-only feedback, intervention_preset for immutable
+configurations/ancestry, and local_researcher for the inspected model's fixed-menu decisions. Calibrate required
+layers explicitly before freezing additive jobs or presets. Keep the researcher's configuration separate from
+the target's, and evaluate chosen actions separately on identical starting targets. Do not adapt a measured
+researcher's frozen brief/menu using your own reasoning or expose validation/final labels to it.
+Use capture_selected for bounded MLP scalars and score_sequence/generate_one scopes for matched patches.
 Use compare or top_firing for screening, respecting the calibration source and bounded token limits.
 A short reference calibration is only a scale estimate, not corpus-wide activation statistics or a percentile.
 If a tool reports a model/resource error, explain it and continue work that does not require that operation.
