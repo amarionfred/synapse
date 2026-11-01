@@ -1,0 +1,10 @@
+schema: openrig.project/v0alpha1
+kind: project
+id: synapse
+metadata:
+  id: synapse
+  name: Synapse
+install:
+  intent: README.md
+  context:
+    - AGENTS.md

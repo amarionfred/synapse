@@ -1,0 +1,13 @@
+schema: openrig.mission/v0alpha1
+kind: mission
+metadata:
+  status: active
+composition:
+  mission_markdown:
+    spec: SPEC.md
+  slices:
+    - ref: slices/01-weight-only-selection/slice.yaml
+      order: 10
+      active: true
+
+# Optional team and SDLC sections are added here.
